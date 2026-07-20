@@ -1,4 +1,4 @@
-"""SAFARI 1.0 — read-only trading copilot for Telegram.
+"""SAFARI 1.1 — verified read-only trading copilot for Telegram.
 
 Safety contract:
 - Reads screenshots and Webull account/position data.
@@ -34,10 +34,15 @@ from telegram.ext import (
 
 try:
     from webull.core.client import ApiClient
-    from webull.trade.trade_client import TradeClient
-except ImportError:  # The bot still keeps screenshot mode alive if SDK install fails.
+    from webull.core.http.initializer.token.token_manager import TokenManager
+    from webull.core.http.initializer.token.token_operation import TokenOperation
+    from webull.trade.trade.v2.account_info_v2 import AccountV2
+except ImportError:  # Screenshot mode remains available if the SDK is missing.
     ApiClient = None  # type: ignore[assignment]
-    TradeClient = None  # type: ignore[assignment]
+    TokenManager = None  # type: ignore[assignment]
+    TokenOperation = None  # type: ignore[assignment]
+    AccountV2 = None  # type: ignore[assignment]
+
 
 
 # ---------------------------------------------------------------------------
@@ -66,14 +71,14 @@ STATE_FILE = DATA_DIR / "safari_state.json"
 
 MAX_TELEGRAM_MESSAGE = 3900
 READ_ONLY_MODE = True
-WEBULL_TOKEN_CHECK_INTERVAL_SECONDS = int(os.getenv("WEBULL_TOKEN_CHECK_INTERVAL_SECONDS", "20"))
-WEBULL_TOKEN_CHECK_DURATION_SECONDS = int(os.getenv("WEBULL_TOKEN_CHECK_DURATION_SECONDS", "280"))
-WEBULL_COMMAND_COOLDOWN_SECONDS = int(os.getenv("WEBULL_COMMAND_COOLDOWN_SECONDS", "360"))
+PERSISTENT_STORAGE = bool(os.getenv("RAILWAY_VOLUME_MOUNT_PATH"))
+WEBULL_LOCAL_COOLDOWN_SECONDS = int(os.getenv("WEBULL_LOCAL_COOLDOWN_SECONDS", "15"))
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
+logging.getLogger("webull").setLevel(logging.WARNING)
 logger = logging.getLogger("safari")
 
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
@@ -246,43 +251,130 @@ state_store = JsonStateStore(STATE_FILE)
 
 
 class WebullReadOnlyError(RuntimeError):
-    pass
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        super().__init__(message)
 
 
 class WebullReadOnly:
-    """Only account list, balances and positions are exposed here."""
+    """Manual one-request auth flow plus read-only account access.
+
+    This class deliberately avoids TradeClient construction because that
+    constructor starts the SDK token polling loop. Each Telegram command below
+    performs at most one explicit token operation.
+    """
 
     def __init__(self) -> None:
         self.enabled = bool(WEBULL_APP_KEY and WEBULL_APP_SECRET)
-        self.client: Any = None
+        self.api_client: Any = None
+        self.token_manager: Any = None
+        self.token_operation: Any = None
+        self.account_v2: Any = None
 
         if not self.enabled:
             return
-        if ApiClient is None or TradeClient is None:
-            raise WebullReadOnlyError("Webull SDK is not installed")
+        if any(item is None for item in (ApiClient, TokenManager, TokenOperation, AccountV2)):
+            raise WebullReadOnlyError("SDK_MISSING", "Webull SDK is not installed")
 
         WEBULL_TOKEN_DIR.mkdir(parents=True, exist_ok=True)
-        api_client = ApiClient(
-            WEBULL_APP_KEY,
-            WEBULL_APP_SECRET,
-            WEBULL_REGION,
-            token_check_duration_seconds=WEBULL_TOKEN_CHECK_DURATION_SECONDS,
-            token_check_interval_seconds=WEBULL_TOKEN_CHECK_INTERVAL_SECONDS,
-        )
+        api_client = ApiClient(WEBULL_APP_KEY, WEBULL_APP_SECRET, WEBULL_REGION)
         api_client.add_endpoint(WEBULL_REGION, WEBULL_ENDPOINT)
         api_client.set_token_dir(str(WEBULL_TOKEN_DIR))
-        self.client = TradeClient(api_client)
+
+        self.api_client = api_client
+        self.token_manager = TokenManager(str(WEBULL_TOKEN_DIR))
+        self.token_operation = TokenOperation(api_client)
+        self.account_v2 = AccountV2(api_client)
 
     @staticmethod
     def _response_json(response: Any, operation: str) -> Any:
         status_code = getattr(response, "status_code", None)
         if status_code != 200:
             body = clean_text(getattr(response, "text", ""), "невідома помилка")
-            raise WebullReadOnlyError(f"{operation}: HTTP {status_code}: {body[:500]}")
+            upper = body.upper()
+            if status_code == 429 or "TOO_MANY_REQUESTS" in upper:
+                raise WebullReadOnlyError("RATE_LIMIT", f"{operation}: Webull rate limit (429)")
+            if status_code == 417 or "INVALID_TOKEN" in upper:
+                raise WebullReadOnlyError("INVALID_TOKEN", f"{operation}: token invalid or expired")
+            if status_code in {401, 403}:
+                raise WebullReadOnlyError("UNAUTHORIZED", f"{operation}: unauthorized ({status_code})")
+            raise WebullReadOnlyError("HTTP_ERROR", f"{operation}: HTTP {status_code}")
         try:
             return response.json()
         except Exception as error:
-            raise WebullReadOnlyError(f"{operation}: invalid JSON response") from error
+            raise WebullReadOnlyError("INVALID_JSON", f"{operation}: invalid JSON response") from error
+
+    @staticmethod
+    def _validate_token_payload(payload: Any, operation: str) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise WebullReadOnlyError("TOKEN_RESPONSE", f"{operation}: empty token response")
+        token = payload.get("token")
+        status = clean_text(payload.get("status"), "UNKNOWN").upper()
+        expires = payload.get("expires")
+        if not token or status == "UNKNOWN":
+            raise WebullReadOnlyError("TOKEN_RESPONSE", f"{operation}: incomplete token response")
+        return {"token": str(token), "status": status, "expires": expires}
+
+    def _load_local_token(self) -> dict[str, Any] | None:
+        local = self.token_manager.load_token_from_local()
+        if local is None:
+            return None
+        return {
+            "token": clean_text(getattr(local, "token", None), ""),
+            "expires": getattr(local, "expires", None),
+            "status": clean_text(getattr(local, "status", None), "UNKNOWN").upper(),
+        }
+
+    def _save_token(self, token_data: dict[str, Any]) -> None:
+        self.token_manager.save_token_to_local(token_data)
+        if token_data.get("status") == "NORMAL":
+            self.api_client.set_token(token_data["token"])
+
+    def auth_start_sync(self) -> dict[str, Any]:
+        """Create or refresh a token exactly once. Never polls."""
+        if not self.enabled:
+            raise WebullReadOnlyError("NOT_CONFIGURED", "Webull keys are not configured")
+        local = self._load_local_token()
+        local_token = local.get("token") if local else None
+        response = self.token_operation.create_token(local_token)
+        token_data = self._validate_token_payload(
+            self._response_json(response, "create token"),
+            "create token",
+        )
+        self._save_token(token_data)
+        return {"status": token_data["status"], "expires": token_data.get("expires")}
+
+    def auth_check_sync(self) -> dict[str, Any]:
+        """Check a token exactly once. Never polls."""
+        if not self.enabled:
+            raise WebullReadOnlyError("NOT_CONFIGURED", "Webull keys are not configured")
+        local = self._load_local_token()
+        if not local or not local.get("token"):
+            raise WebullReadOnlyError("NO_TOKEN", "No Webull token exists; run WEBULL AUTH")
+        response = self.token_operation.check_token(local["token"])
+        token_data = self._validate_token_payload(
+            self._response_json(response, "check token"),
+            "check token",
+        )
+        self._save_token(token_data)
+        return {"status": token_data["status"], "expires": token_data.get("expires")}
+
+    def auth_state_sync(self) -> dict[str, Any]:
+        local = self._load_local_token()
+        if not local:
+            return {"status": "MISSING", "expires": None}
+        return {"status": local.get("status", "UNKNOWN"), "expires": local.get("expires")}
+
+    def _activate_saved_token(self) -> None:
+        local = self._load_local_token()
+        if not local or not local.get("token"):
+            raise WebullReadOnlyError("NO_TOKEN", "No Webull token exists; run WEBULL AUTH")
+        if local.get("status") != "NORMAL":
+            raise WebullReadOnlyError(
+                "TOKEN_NOT_READY",
+                f"Stored Webull token status is {local.get('status', 'UNKNOWN')}",
+            )
+        self.api_client.set_token(local["token"])
 
     @staticmethod
     def _find_account_ids(payload: Any) -> list[str]:
@@ -304,25 +396,26 @@ class WebullReadOnly:
         return list(dict.fromkeys(found))
 
     def account_snapshot_sync(self) -> dict[str, Any]:
-        if not self.enabled or self.client is None:
-            raise WebullReadOnlyError("Webull keys are not configured")
+        if not self.enabled or self.account_v2 is None:
+            raise WebullReadOnlyError("NOT_CONFIGURED", "Webull keys are not configured")
+        self._activate_saved_token()
 
         accounts_payload = self._response_json(
-            self.client.account_v2.get_account_list(),
+            self.account_v2.get_account_list(),
             "account list",
         )
         account_ids = self._find_account_ids(accounts_payload)
         if not account_ids:
-            raise WebullReadOnlyError("Webull returned no account_id")
+            raise WebullReadOnlyError("NO_ACCOUNT", "Webull returned no account_id")
 
         account_results: list[dict[str, Any]] = []
         for account_id in account_ids:
             positions = self._response_json(
-                self.client.account_v2.get_account_position(account_id),
+                self.account_v2.get_account_position(account_id),
                 "account positions",
             )
             balance = self._response_json(
-                self.client.account_v2.get_account_balance(account_id),
+                self.account_v2.get_account_balance(account_id),
                 "account balance",
             )
             account_results.append(
@@ -339,6 +432,15 @@ class WebullReadOnly:
             "accounts": account_results,
         }
 
+    async def auth_start(self) -> dict[str, Any]:
+        return await asyncio.to_thread(self.auth_start_sync)
+
+    async def auth_check(self) -> dict[str, Any]:
+        return await asyncio.to_thread(self.auth_check_sync)
+
+    async def auth_state(self) -> dict[str, Any]:
+        return await asyncio.to_thread(self.auth_state_sync)
+
     async def account_snapshot(self) -> dict[str, Any]:
         return await asyncio.to_thread(self.account_snapshot_sync)
 
@@ -349,10 +451,9 @@ except Exception as webull_init_error:
     logger.exception("Webull initialization failed: %s", webull_init_error)
     webull_reader = None
 
-# One Webull authorization/read attempt at a time. This prevents duplicate
-# Telegram commands from starting multiple SDK token loops and hitting 429.
-webull_request_lock = asyncio.Lock()
-webull_last_attempt_monotonic = 0.0
+# Exactly one explicit Webull operation at a time. No background polling.
+webull_operation_lock = asyncio.Lock()
+webull_last_request_monotonic = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -360,7 +461,7 @@ webull_last_attempt_monotonic = 0.0
 # ---------------------------------------------------------------------------
 
 SCREENSHOT_ANALYSIS_PROMPT = r"""
-Ти — 🦁 SAFARI 1.0, read-only Trading Copilot.
+Ти — 🦁 SAFARI 1.1, read-only Trading Copilot.
 Ти НІКОЛИ не відкриваєш, не змінюєш і не закриваєш угоди. Лише читаєш,
 аналізуєш і даєш рекомендацію, остаточне рішення завжди за трейдером.
 
@@ -832,16 +933,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     del context
     if not update.message:
         return
+    storage_line = (
+        "💾 Пам’ять: постійна ✅"
+        if PERSISTENT_STORAGE
+        else "⚠️ Пам’ять: тимчасова — потрібен Railway Volume"
+    )
     await update.message.reply_text(
-        "🦁 SAFARI 1.0 на зв’язку.\n\n"
+        "🦁 SAFARI 1.1 на зв’язку.\n\n"
         "Тільки читання, аналіз і рекомендації. Автоматичних угод немає.\n\n"
         "Команди:\n"
         "• надішли скріншот — VISION + TRADING/GUARDIAN\n"
-        "• WEBULL — живі позиції з Webull\n"
+        "• WEBULL AUTH — створити один запит 2FA\n"
+        "• WEBULL CHECK — одна перевірка підтвердження\n"
+        "• WEBULL — живі позиції після авторизації\n"
         "• МОЇ ПОЗИЦІЇ — локальна пам’ять\n"
         "• ЧОМУ? — повне пояснення\n"
         "• ДОСЬЄ — журнал завершених угод\n"
-        "• ЗАКРИВ SOFI ... — записати завершену угоду"
+        "• ЗАКРИВ SOFI ... — записати завершену угоду\n\n"
+        + storage_line
     )
 
 
@@ -866,86 +975,190 @@ async def dossier_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await send_long_message(update.message, format_dossier(update.effective_user.id))
 
 
-async def webull_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context
-    global webull_last_attempt_monotonic
+def _webull_ready() -> bool:
+    return bool(webull_reader is not None and getattr(webull_reader, "enabled", False))
 
+
+async def _webull_guard(message: Any) -> bool:
+    """Local anti-spam guard only; it never calls Webull."""
+    global webull_last_request_monotonic
+    if webull_operation_lock.locked():
+        await message.reply_text(
+            "🦁 SAFARI WEBULL\n\n⏳ Інша Webull-операція ще виконується. Не повторюй команду."
+        )
+        return False
+    now = time.monotonic()
+    elapsed = now - webull_last_request_monotonic
+    if webull_last_request_monotonic and elapsed < WEBULL_LOCAL_COOLDOWN_SECONDS:
+        seconds = int(WEBULL_LOCAL_COOLDOWN_SECONDS - elapsed) + 1
+        await message.reply_text(
+            f"🦁 SAFARI WEBULL\n\n🛡 Локальний захист: зачекай {seconds} сек. Це не запит до Webull."
+        )
+        return False
+    webull_last_request_monotonic = now
+    return True
+
+
+async def webull_auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    del context
     if not update.message:
         return
-
-    if webull_reader is None or not getattr(webull_reader, "enabled", False):
+    if not _webull_ready():
         await update.message.reply_text(
-            "🦁 SAFARI WEBULL\n\n"
-            "❌ Webull ще не підключений або SDK не встановлено."
+            "🦁 SAFARI WEBULL\n\n❌ Webull ключі не підключені або SDK не встановлено."
         )
         return
-
-    if webull_request_lock.locked():
-        await update.message.reply_text(
-            "🦁 SAFARI WEBULL\n\n"
-            "⏳ Запит уже активний. Не надсилай WEBULL повторно.\n\n"
-            "👉 Відкрий Webull на телефоні → Messages → OpenAPI Notice → "
-            "найновіше повідомлення → Check Now → SMS code → Confirm."
-        )
+    if not await _webull_guard(update.message):
         return
 
-    now = time.monotonic()
-    elapsed = now - webull_last_attempt_monotonic
-    if webull_last_attempt_monotonic and elapsed < WEBULL_COMMAND_COOLDOWN_SECONDS:
-        wait_seconds = int(WEBULL_COMMAND_COOLDOWN_SECONDS - elapsed) + 1
+    async with webull_operation_lock:
+        status_message = await update.message.reply_text(
+            "🦁 SAFARI WEBULL AUTH\n\n🔐 Створюю рівно ОДИН запит авторизації. Автоматичних перевірок не буде."
+        )
+        try:
+            result = await webull_reader.auth_start()
+            token_status = clean_text(result.get("status"), "UNKNOWN").upper()
+            if token_status == "NORMAL":
+                message = (
+                    "🦁 SAFARI WEBULL AUTH ✅\n\n"
+                    "Токен уже підтверджений.\n\n👉 Одна дія: напиши WEBULL."
+                )
+            elif token_status == "PENDING":
+                message = (
+                    "🦁 SAFARI WEBULL AUTH\n\n"
+                    "📩 Один новий OpenAPI Notice створено.\n"
+                    "Відкрий Webull на телефоні → OpenAPI Notice → найновіше повідомлення → Confirm.\n\n"
+                    "👉 Після підтвердження напиши WEBULL CHECK один раз."
+                )
+            elif token_status in {"INVALID", "EXPIRED"}:
+                message = (
+                    f"🦁 SAFARI WEBULL AUTH\n\n❌ Статус токена: {token_status}.\n"
+                    "Не повторюй команду; покажи відповідь для перевірки."
+                )
+            else:
+                message = f"🦁 SAFARI WEBULL AUTH\n\n⚠️ Невідомий статус: {token_status}."
+            await status_message.edit_text(message)
+        except WebullReadOnlyError as error:
+            logger.warning("Webull auth start failed: %s", error.code)
+            if error.code == "RATE_LIMIT":
+                message = (
+                    "🦁 SAFARI WEBULL AUTH\n\n⏸ Webull повернув 429. SAFARI не робитиме повторів.\n\n"
+                    "👉 Нічого не натискай; покажи цю відповідь."
+                )
+            else:
+                message = f"🦁 SAFARI WEBULL AUTH\n\n❌ {error}"
+            await status_message.edit_text(message)
+        except Exception:
+            logger.exception("Unexpected Webull auth error")
+            await status_message.edit_text(
+                "🦁 SAFARI WEBULL AUTH\n\n❌ Неочікувана помилка. SAFARI не повторював запит автоматично."
+            )
+
+
+async def webull_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    del context
+    if not update.message:
+        return
+    if not _webull_ready():
         await update.message.reply_text(
-            "🦁 SAFARI WEBULL\n\n"
-            f"🕒 Захист від 429: повторний запит буде доступний через приблизно {wait_seconds // 60 + 1} хв.\n\n"
-            "Не натискай WEBULL повторно."
+            "🦁 SAFARI WEBULL\n\n❌ Webull ключі не підключені або SDK не встановлено."
         )
         return
+    if not await _webull_guard(update.message):
+        return
 
-    async with webull_request_lock:
-        webull_last_attempt_monotonic = time.monotonic()
-        status = await update.message.reply_text(
-            "🦁 SAFARI WEBULL — ПІДТВЕРДЖЕННЯ\n\n"
-            "🔐 Я створюю ОДИН запит авторизації.\n"
-            "У тебе є до 5 хвилин.\n\n"
-            "👉 ЗАРАЗ відкрий Webull на телефоні → Messages → OpenAPI Notice → "
-            "найновіше повідомлення → Check Now → введи SMS code → Confirm.\n\n"
-            "Не надсилай WEBULL повторно — SAFARI сам дочекається підтвердження."
+    async with webull_operation_lock:
+        status_message = await update.message.reply_text(
+            "🦁 SAFARI WEBULL CHECK\n\n🔎 Виконую рівно ОДНУ перевірку токена."
+        )
+        try:
+            result = await webull_reader.auth_check()
+            token_status = clean_text(result.get("status"), "UNKNOWN").upper()
+            if token_status == "NORMAL":
+                message = (
+                    "🦁 SAFARI WEBULL CHECK ✅\n\nАвторизацію підтверджено, токен збережено.\n\n"
+                    "👉 Одна дія: напиши WEBULL."
+                )
+            elif token_status == "PENDING":
+                message = (
+                    "🦁 SAFARI WEBULL CHECK\n\n⌛ Токен ще PENDING.\n"
+                    "Переконайся, що підтвердив найновіше OpenAPI Notice.\n\n"
+                    "👉 Не повторюй одразу; спочатку перевір застосунок Webull."
+                )
+            elif token_status in {"INVALID", "EXPIRED"}:
+                message = (
+                    f"🦁 SAFARI WEBULL CHECK\n\n❌ Статус: {token_status}.\n\n"
+                    "👉 Одна дія: напиши WEBULL AUTH один раз."
+                )
+            else:
+                message = f"🦁 SAFARI WEBULL CHECK\n\n⚠️ Невідомий статус: {token_status}."
+            await status_message.edit_text(message)
+        except WebullReadOnlyError as error:
+            logger.warning("Webull auth check failed: %s", error.code)
+            if error.code == "RATE_LIMIT":
+                message = (
+                    "🦁 SAFARI WEBULL CHECK\n\n⏸ Webull повернув 429. SAFARI не робитиме повторів.\n\n"
+                    "👉 Нічого не натискай; покажи цю відповідь."
+                )
+            elif error.code == "NO_TOKEN":
+                message = "🦁 SAFARI WEBULL CHECK\n\n❌ Немає токена.\n\n👉 Напиши WEBULL AUTH один раз."
+            else:
+                message = f"🦁 SAFARI WEBULL CHECK\n\n❌ {error}"
+            await status_message.edit_text(message)
+        except Exception:
+            logger.exception("Unexpected Webull check error")
+            await status_message.edit_text(
+                "🦁 SAFARI WEBULL CHECK\n\n❌ Неочікувана помилка. Автоматичних повторів не було."
+            )
+
+
+async def webull_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    del context
+    if not update.message:
+        return
+    if not _webull_ready():
+        await update.message.reply_text(
+            "🦁 SAFARI WEBULL\n\n❌ Webull ключі не підключені або SDK не встановлено."
+        )
+        return
+    if not await _webull_guard(update.message):
+        return
+
+    async with webull_operation_lock:
+        status_message = await update.message.reply_text(
+            "🦁 SAFARI WEBULL — READ ONLY\n\n📥 Читаю рахунок і позиції. Жодних торгових команд у коді немає."
         )
         try:
             snapshot = await webull_reader.account_snapshot()
             summary = await summarize_webull(snapshot)
-            await status.edit_text(
+            await status_message.edit_text(
                 "🦁 SAFARI WEBULL — READ ONLY ✅\n"
                 f"🕒 {snapshot.get('fetched_at_utc')}\n\n{summary}"
             )
-        except Exception as error:
-            logger.exception("Webull read failed: %s", error)
-            error_text = str(error)
-            error_upper = error_text.upper()
-
-            if "429" in error_text or "TOO_MANY_REQUESTS" in error_upper:
-                user_message = (
-                    "🦁 SAFARI WEBULL\n\n"
-                    "⏸ Webull тимчасово обмежив частоту запитів (429).\n"
-                    "SAFARI не буде повторювати запити автоматично.\n\n"
-                    "👉 Зачекай 10 хвилин. Потім напиши WEBULL лише один раз і "
-                    "відразу підтвердь НАЙНОВІШЕ OpenAPI Notice протягом 5 хвилин."
+        except WebullReadOnlyError as error:
+            logger.warning("Webull read failed: %s", error.code)
+            if error.code in {"NO_TOKEN", "TOKEN_NOT_READY", "INVALID_TOKEN"}:
+                message = (
+                    "🦁 SAFARI WEBULL\n\n🔐 Авторизація ще не готова або токен прострочений.\n\n"
+                    "👉 Одна дія: напиши WEBULL AUTH."
                 )
-            elif "ERROR_INIT_TOKEN" in error_upper or "EXPIRED" in error_upper or "PENDING" in error_upper:
-                user_message = (
-                    "🦁 SAFARI WEBULL\n\n"
-                    "⌛ Підтвердження не завершене в межах 5 хвилин або старе повідомлення вже прострочене.\n\n"
-                    "👉 Після завершення захисної паузи напиши WEBULL один раз і підтвердь "
-                    "лише НАЙНОВІШЕ OpenAPI Notice."
+            elif error.code == "RATE_LIMIT":
+                message = (
+                    "🦁 SAFARI WEBULL\n\n⏸ Webull повернув 429. SAFARI не робитиме повторів.\n\n"
+                    "👉 Нічого не натискай; покажи цю відповідь."
+                )
+            elif error.code == "UNAUTHORIZED":
+                message = (
+                    "🦁 SAFARI WEBULL\n\n❌ Webull відхилив авторизацію.\n\n"
+                    "👉 Одна дія: напиши WEBULL AUTH."
                 )
             else:
-                user_message = (
-                    "🦁 SAFARI WEBULL\n\n"
-                    "❌ Webull не віддав позиції.\n\n"
-                    "👉 Не повторюй команду. Покажи цю технічну відповідь для перевірки."
-                )
-
-            await status.edit_text(
-                user_message + "\n\n" + f"Технічна відповідь: {error_text[:700]}"
+                message = f"🦁 SAFARI WEBULL\n\n❌ {error}"
+            await status_message.edit_text(message)
+        except Exception:
+            logger.exception("Unexpected Webull read error")
+            await status_message.edit_text(
+                "🦁 SAFARI WEBULL\n\n❌ Неочікувана помилка. Автоматичних повторів не було."
             )
 
 
@@ -1013,6 +1226,14 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     original = (update.message.text or "").strip()
     normalized = original.casefold().strip()
 
+    if normalized in {"webull auth", "вебул auth", "вебул авторизація", "webull авторизація"}:
+        await webull_auth(update, context)
+        return
+
+    if normalized in {"webull check", "вебул check", "вебул перевірка", "webull перевірка"}:
+        await webull_check(update, context)
+        return
+
     if normalized in {"webull", "вебул", "рахунок", "живі позиції"}:
         await webull_status(update, context)
         return
@@ -1063,7 +1284,7 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     status = await update.message.reply_text(
-        "🦁 SAFARI 1.0\n\n👁️ Читаю дані й спочатку шукаю причини проти…"
+        "🦁 SAFARI 1.1\n\n👁️ Читаю дані й спочатку шукаю причини проти…"
     )
 
     destination: Path | None = None
@@ -1120,6 +1341,8 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("webull", webull_status))
+    app.add_handler(CommandHandler("webull_auth", webull_auth))
+    app.add_handler(CommandHandler("webull_check", webull_check))
     app.add_handler(CommandHandler("positions", positions_command))
     app.add_handler(CommandHandler("why", why_message))
     app.add_handler(CommandHandler("dossier", dossier_command))
@@ -1127,7 +1350,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
 
     logger.info(
-        "SAFARI 1.0 started | read_only=%s | webull_configured=%s | data_dir=%s",
+        "SAFARI 1.1 started | read_only=%s | webull_configured=%s | data_dir=%s",
         READ_ONLY_MODE,
         bool(WEBULL_APP_KEY and WEBULL_APP_SECRET),
         DATA_DIR,
