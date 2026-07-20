@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -65,6 +66,9 @@ STATE_FILE = DATA_DIR / "safari_state.json"
 
 MAX_TELEGRAM_MESSAGE = 3900
 READ_ONLY_MODE = True
+WEBULL_TOKEN_CHECK_INTERVAL_SECONDS = int(os.getenv("WEBULL_TOKEN_CHECK_INTERVAL_SECONDS", "20"))
+WEBULL_TOKEN_CHECK_DURATION_SECONDS = int(os.getenv("WEBULL_TOKEN_CHECK_DURATION_SECONDS", "280"))
+WEBULL_COMMAND_COOLDOWN_SECONDS = int(os.getenv("WEBULL_COMMAND_COOLDOWN_SECONDS", "360"))
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -258,7 +262,13 @@ class WebullReadOnly:
             raise WebullReadOnlyError("Webull SDK is not installed")
 
         WEBULL_TOKEN_DIR.mkdir(parents=True, exist_ok=True)
-        api_client = ApiClient(WEBULL_APP_KEY, WEBULL_APP_SECRET, WEBULL_REGION)
+        api_client = ApiClient(
+            WEBULL_APP_KEY,
+            WEBULL_APP_SECRET,
+            WEBULL_REGION,
+            token_check_duration_seconds=WEBULL_TOKEN_CHECK_DURATION_SECONDS,
+            token_check_interval_seconds=WEBULL_TOKEN_CHECK_INTERVAL_SECONDS,
+        )
         api_client.add_endpoint(WEBULL_REGION, WEBULL_ENDPOINT)
         api_client.set_token_dir(str(WEBULL_TOKEN_DIR))
         self.client = TradeClient(api_client)
@@ -338,6 +348,11 @@ try:
 except Exception as webull_init_error:
     logger.exception("Webull initialization failed: %s", webull_init_error)
     webull_reader = None
+
+# One Webull authorization/read attempt at a time. This prevents duplicate
+# Telegram commands from starting multiple SDK token loops and hitting 429.
+webull_request_lock = asyncio.Lock()
+webull_last_attempt_monotonic = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -853,6 +868,8 @@ async def dossier_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def webull_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     del context
+    global webull_last_attempt_monotonic
+
     if not update.message:
         return
 
@@ -863,26 +880,73 @@ async def webull_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    status = await update.message.reply_text(
-        "🦁 SAFARI WEBULL\n\n🔄 Читаю рахунок і відкриті позиції…"
-    )
-    try:
-        snapshot = await webull_reader.account_snapshot()
-        summary = await summarize_webull(snapshot)
-        await status.edit_text(
-            "🦁 SAFARI WEBULL — READ ONLY\n"
-            f"🕒 {snapshot.get('fetched_at_utc')}\n\n{summary}"
-        )
-    except Exception as error:
-        logger.exception("Webull read failed: %s", error)
-        error_text = str(error)
-        await status.edit_text(
+    if webull_request_lock.locked():
+        await update.message.reply_text(
             "🦁 SAFARI WEBULL\n\n"
-            "🔐 Webull не віддав позиції. На першому підключенні може бути "
-            "потрібне підтвердження 2FA у застосунку Webull.\n\n"
-            "👉 Відкрий Webull, підтвердь запит API, потім напиши WEBULL ще раз.\n\n"
-            f"Технічна відповідь: {error_text[:700]}"
+            "⏳ Запит уже активний. Не надсилай WEBULL повторно.\n\n"
+            "👉 Відкрий Webull на телефоні → Messages → OpenAPI Notice → "
+            "найновіше повідомлення → Check Now → SMS code → Confirm."
         )
+        return
+
+    now = time.monotonic()
+    elapsed = now - webull_last_attempt_monotonic
+    if webull_last_attempt_monotonic and elapsed < WEBULL_COMMAND_COOLDOWN_SECONDS:
+        wait_seconds = int(WEBULL_COMMAND_COOLDOWN_SECONDS - elapsed) + 1
+        await update.message.reply_text(
+            "🦁 SAFARI WEBULL\n\n"
+            f"🕒 Захист від 429: повторний запит буде доступний через приблизно {wait_seconds // 60 + 1} хв.\n\n"
+            "Не натискай WEBULL повторно."
+        )
+        return
+
+    async with webull_request_lock:
+        webull_last_attempt_monotonic = time.monotonic()
+        status = await update.message.reply_text(
+            "🦁 SAFARI WEBULL — ПІДТВЕРДЖЕННЯ\n\n"
+            "🔐 Я створюю ОДИН запит авторизації.\n"
+            "У тебе є до 5 хвилин.\n\n"
+            "👉 ЗАРАЗ відкрий Webull на телефоні → Messages → OpenAPI Notice → "
+            "найновіше повідомлення → Check Now → введи SMS code → Confirm.\n\n"
+            "Не надсилай WEBULL повторно — SAFARI сам дочекається підтвердження."
+        )
+        try:
+            snapshot = await webull_reader.account_snapshot()
+            summary = await summarize_webull(snapshot)
+            await status.edit_text(
+                "🦁 SAFARI WEBULL — READ ONLY ✅\n"
+                f"🕒 {snapshot.get('fetched_at_utc')}\n\n{summary}"
+            )
+        except Exception as error:
+            logger.exception("Webull read failed: %s", error)
+            error_text = str(error)
+            error_upper = error_text.upper()
+
+            if "429" in error_text or "TOO_MANY_REQUESTS" in error_upper:
+                user_message = (
+                    "🦁 SAFARI WEBULL\n\n"
+                    "⏸ Webull тимчасово обмежив частоту запитів (429).\n"
+                    "SAFARI не буде повторювати запити автоматично.\n\n"
+                    "👉 Зачекай 10 хвилин. Потім напиши WEBULL лише один раз і "
+                    "відразу підтвердь НАЙНОВІШЕ OpenAPI Notice протягом 5 хвилин."
+                )
+            elif "ERROR_INIT_TOKEN" in error_upper or "EXPIRED" in error_upper or "PENDING" in error_upper:
+                user_message = (
+                    "🦁 SAFARI WEBULL\n\n"
+                    "⌛ Підтвердження не завершене в межах 5 хвилин або старе повідомлення вже прострочене.\n\n"
+                    "👉 Після завершення захисної паузи напиши WEBULL один раз і підтвердь "
+                    "лише НАЙНОВІШЕ OpenAPI Notice."
+                )
+            else:
+                user_message = (
+                    "🦁 SAFARI WEBULL\n\n"
+                    "❌ Webull не віддав позиції.\n\n"
+                    "👉 Не повторюй команду. Покажи цю технічну відповідь для перевірки."
+                )
+
+            await status.edit_text(
+                user_message + "\n\n" + f"Технічна відповідь: {error_text[:700]}"
+            )
 
 
 async def why_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
