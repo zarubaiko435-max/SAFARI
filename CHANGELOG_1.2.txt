@@ -1,0 +1,14 @@
+SAFARI 1.2 RATE-LIMIT SAFE
+
+Verified fixes:
+1. Catches Webull SDK ServerException before it becomes a generic Telegram error.
+2. Maps HTTP 429 / TOO_MANY_REQUESTS to RATE_LIMIT.
+3. Logs the exact operation: account list, account positions, or account balance.
+4. Shows the exact failed operation in Telegram.
+5. Adds a default 2.2-second delay between distinct account API calls.
+6. Keeps one attempt per endpoint: no retries, no polling, read-only only.
+
+Safe test after deployment:
+- Send WEBULL once.
+- Do not repeat after an error.
+- Show the Telegram response; it now identifies the failed stage.

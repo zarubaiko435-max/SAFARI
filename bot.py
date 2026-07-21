@@ -1,4 +1,4 @@
-"""SAFARI 1.1 — verified read-only trading copilot for Telegram.
+"""SAFARI 1.2 — rate-limit-safe read-only trading copilot for Telegram.
 
 Safety contract:
 - Reads screenshots and Webull account/position data.
@@ -33,12 +33,14 @@ from telegram.ext import (
 )
 
 try:
-    from webull.core.client import ApiClient
+    from webull.core.client import ApiClient, ClientException, ServerException
     from webull.core.http.initializer.token.token_manager import TokenManager
     from webull.core.http.initializer.token.token_operation import TokenOperation
     from webull.trade.trade.v2.account_info_v2 import AccountV2
 except ImportError:  # Screenshot mode remains available if the SDK is missing.
     ApiClient = None  # type: ignore[assignment]
+    ClientException = None  # type: ignore[assignment]
+    ServerException = None  # type: ignore[assignment]
     TokenManager = None  # type: ignore[assignment]
     TokenOperation = None  # type: ignore[assignment]
     AccountV2 = None  # type: ignore[assignment]
@@ -73,6 +75,7 @@ MAX_TELEGRAM_MESSAGE = 3900
 READ_ONLY_MODE = True
 PERSISTENT_STORAGE = bool(os.getenv("RAILWAY_VOLUME_MOUNT_PATH"))
 WEBULL_LOCAL_COOLDOWN_SECONDS = int(os.getenv("WEBULL_LOCAL_COOLDOWN_SECONDS", "15"))
+WEBULL_INTERCALL_DELAY_SECONDS = float(os.getenv("WEBULL_INTERCALL_DELAY_SECONDS", "2.2"))
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -287,6 +290,64 @@ class WebullReadOnly:
         self.account_v2 = AccountV2(api_client)
 
     @staticmethod
+    def _raise_mapped_sdk_error(error: Exception, operation: str) -> None:
+        """Convert SDK exceptions into stable SAFARI error codes. Never retries."""
+        http_status = getattr(error, "http_status", None)
+        error_code = clean_text(getattr(error, "error_code", None), "").upper()
+        error_msg = clean_text(getattr(error, "error_msg", None), str(error))
+        request_id = clean_text(getattr(error, "request_id", None), "")
+        combined = f"{error_code} {error_msg}".upper()
+
+        logger.warning(
+            "WEBULL_API_ERROR operation=%s http_status=%s error_code=%s request_id=%s",
+            operation,
+            http_status,
+            error_code or "UNKNOWN",
+            request_id or "NONE",
+        )
+
+        if http_status == 429 or "TOO_MANY_REQUESTS" in combined or "TOO MANY REQUESTS" in combined:
+            raise WebullReadOnlyError(
+                "RATE_LIMIT",
+                f"{operation}: Webull rate limit (429)",
+            ) from error
+        if http_status == 417 or "INVALID_TOKEN" in combined:
+            raise WebullReadOnlyError(
+                "INVALID_TOKEN",
+                f"{operation}: token invalid or expired",
+            ) from error
+        if http_status in {401, 403} or "UNAUTHORIZED" in combined:
+            raise WebullReadOnlyError(
+                "UNAUTHORIZED",
+                f"{operation}: unauthorized ({http_status or 'unknown'})",
+            ) from error
+        raise WebullReadOnlyError(
+            "SDK_ERROR",
+            f"{operation}: {error_msg}",
+        ) from error
+
+    def _api_call(self, operation: str, function: Any, *args: Any) -> Any:
+        """Perform exactly one SDK call with explicit operation logging. Never retries."""
+        logger.info("WEBULL_API_CALL start operation=%s", operation)
+        try:
+            response = function(*args)
+        except Exception as error:
+            self._raise_mapped_sdk_error(error, operation)
+            raise  # Unreachable; keeps static analyzers satisfied.
+        logger.info(
+            "WEBULL_API_CALL finish operation=%s status=%s",
+            operation,
+            getattr(response, "status_code", "unknown"),
+        )
+        return response
+
+    @staticmethod
+    def _wait_between_calls() -> None:
+        """Space distinct Webull reads; this is a delay, not an automatic retry."""
+        if WEBULL_INTERCALL_DELAY_SECONDS > 0:
+            time.sleep(WEBULL_INTERCALL_DELAY_SECONDS)
+
+    @staticmethod
     def _response_json(response: Any, operation: str) -> Any:
         status_code = getattr(response, "status_code", None)
         if status_code != 200:
@@ -336,7 +397,7 @@ class WebullReadOnly:
             raise WebullReadOnlyError("NOT_CONFIGURED", "Webull keys are not configured")
         local = self._load_local_token()
         local_token = local.get("token") if local else None
-        response = self.token_operation.create_token(local_token)
+        response = self._api_call("create token", self.token_operation.create_token, local_token)
         token_data = self._validate_token_payload(
             self._response_json(response, "create token"),
             "create token",
@@ -351,7 +412,7 @@ class WebullReadOnly:
         local = self._load_local_token()
         if not local or not local.get("token"):
             raise WebullReadOnlyError("NO_TOKEN", "No Webull token exists; run WEBULL AUTH")
-        response = self.token_operation.check_token(local["token"])
+        response = self._api_call("check token", self.token_operation.check_token, local["token"])
         token_data = self._validate_token_payload(
             self._response_json(response, "check token"),
             "check token",
@@ -401,7 +462,7 @@ class WebullReadOnly:
         self._activate_saved_token()
 
         accounts_payload = self._response_json(
-            self.account_v2.get_account_list(),
+            self._api_call("account list", self.account_v2.get_account_list),
             "account list",
         )
         account_ids = self._find_account_ids(accounts_payload)
@@ -410,12 +471,22 @@ class WebullReadOnly:
 
         account_results: list[dict[str, Any]] = []
         for account_id in account_ids:
+            self._wait_between_calls()
             positions = self._response_json(
-                self.account_v2.get_account_position(account_id),
+                self._api_call(
+                    f"account positions …{account_id[-4:]}",
+                    self.account_v2.get_account_position,
+                    account_id,
+                ),
                 "account positions",
             )
+            self._wait_between_calls()
             balance = self._response_json(
-                self.account_v2.get_account_balance(account_id),
+                self._api_call(
+                    f"account balance …{account_id[-4:]}",
+                    self.account_v2.get_account_balance,
+                    account_id,
+                ),
                 "account balance",
             )
             account_results.append(
@@ -461,7 +532,7 @@ webull_last_request_monotonic = 0.0
 # ---------------------------------------------------------------------------
 
 SCREENSHOT_ANALYSIS_PROMPT = r"""
-Ти — 🦁 SAFARI 1.1, read-only Trading Copilot.
+Ти — 🦁 SAFARI 1.2, read-only Trading Copilot.
 Ти НІКОЛИ не відкриваєш, не змінюєш і не закриваєш угоди. Лише читаєш,
 аналізуєш і даєш рекомендацію, остаточне рішення завжди за трейдером.
 
@@ -939,13 +1010,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         else "⚠️ Пам’ять: тимчасова — потрібен Railway Volume"
     )
     await update.message.reply_text(
-        "🦁 SAFARI 1.1 на зв’язку.\n\n"
+        "🦁 SAFARI 1.2 на зв’язку.\n\n"
         "Тільки читання, аналіз і рекомендації. Автоматичних угод немає.\n\n"
         "Команди:\n"
         "• надішли скріншот — VISION + TRADING/GUARDIAN\n"
         "• WEBULL AUTH — створити один запит 2FA\n"
         "• WEBULL CHECK — одна перевірка підтвердження\n"
-        "• WEBULL — живі позиції після авторизації\n"
+        "• WEBULL — живі позиції після авторизації (з паузами між API-викликами)\n"
         "• МОЇ ПОЗИЦІЇ — локальна пам’ять\n"
         "• ЧОМУ? — повне пояснення\n"
         "• ДОСЬЄ — журнал завершених угод\n"
@@ -1144,7 +1215,8 @@ async def webull_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 )
             elif error.code == "RATE_LIMIT":
                 message = (
-                    "🦁 SAFARI WEBULL\n\n⏸ Webull повернув 429. SAFARI не робитиме повторів.\n\n"
+                    "🦁 SAFARI WEBULL\n\n⏸ Webull повернув 429. Автоматичних повторів не було.\n"
+                    f"📍 Етап: {error}\n\n"
                     "👉 Нічого не натискай; покажи цю відповідь."
                 )
             elif error.code == "UNAUTHORIZED":
@@ -1284,7 +1356,7 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     status = await update.message.reply_text(
-        "🦁 SAFARI 1.1\n\n👁️ Читаю дані й спочатку шукаю причини проти…"
+        "🦁 SAFARI 1.2\n\n👁️ Читаю дані й спочатку шукаю причини проти…"
     )
 
     destination: Path | None = None
