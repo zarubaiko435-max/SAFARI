@@ -1,0 +1,11 @@
+SAFARI 1.4 CORE FIX
+
+- Deterministic days-to-expiration calculation from screenshot expiry.
+- near_expiration is triggered at 14 days or less.
+- Theta exposure estimate for the full position.
+- Break-even is explicitly treated as expiry break-even, not current invalidation.
+- High risk / weakening scenario when expiry is near; no automatic EXIT.
+- Better Webull recognition instructions.
+- Screenshot status/version text updated to 1.4.
+- httpx/httpcore INFO logs disabled so Telegram token URLs are not printed.
+- Read-only safety and Webull no-auto-retry behavior preserved.

@@ -1,4 +1,4 @@
-"""SAFARI 1.3 — Webull-to-GUARDIAN memory bridge, read-only trading copilot.
+"""SAFARI 1.4 CORE FIX — deterministic expiry/theta guardrails, read-only trading copilot.
 
 Safety contract:
 - Reads screenshots and Webull account/position data.
@@ -82,6 +82,8 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logging.getLogger("webull").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("safari")
 
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
@@ -532,7 +534,7 @@ webull_last_request_monotonic = 0.0
 # ---------------------------------------------------------------------------
 
 SCREENSHOT_ANALYSIS_PROMPT = r"""
-Ти — 🦁 SAFARI 1.3, read-only Trading Copilot.
+Ти — 🦁 SAFARI 1.4 CORE FIX, read-only Trading Copilot.
 Ти НІКОЛИ не відкриваєш, не змінюєш і не закриваєш угоди. Лише читаєш,
 аналізуєш і даєш рекомендацію, остаточне рішення завжди за трейдером.
 
@@ -555,6 +557,11 @@ SCREENSHOT_ANALYSIS_PROMPT = r"""
    wide_spread, low_liquidity, near_expiration, earnings_risk,
    poor_risk_reward, conflicting_data. Для кожного status:
    triggered / clear / not_checked.
+10) Поточну дату бери з окремого рядка «Сьогодні UTC». Обов’язково порахуй дні до експірації:
+    0–14 днів = near_expiration triggered; понад 14 = clear; якщо дату не розібрати = not_checked.
+11) Break Even опціону — це беззбитковість НА ЕКСПІРАЦІЮ, а не поточний стоп і не інвалідація.
+12) Якщо до експірації 14 днів або менше, не називай термін «тривалим» або «далеким»; Theta-ризик підвищений.
+13) Якщо інтерфейс упізнається як Webull (Open P&L, Day's P&L, Position Ratio, Sell to Close), platform = "Webull".
 
 ПОВЕРНИ ЛИШЕ ВАЛІДНИЙ JSON, без markdown, за схемою:
 {
@@ -694,6 +701,142 @@ TEXT_CLOSE_PROMPT = r"""
 """.strip()
 
 
+
+_MONTHS = {
+    "jan": 1, "january": 1,
+    "feb": 2, "february": 2,
+    "mar": 3, "march": 3,
+    "apr": 4, "april": 4,
+    "may": 5,
+    "jun": 6, "june": 6,
+    "jul": 7, "july": 7,
+    "aug": 8, "august": 8,
+    "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10,
+    "nov": 11, "november": 11,
+    "dec": 12, "december": 12,
+}
+
+
+def parse_expiration_date(value: Any) -> datetime | None:
+    """Parse common screenshot/API expiry formats without external dependencies."""
+    text = clean_text(value, "").strip()
+    if not text:
+        return None
+    text = re.sub(r"\([^)]*\)", "", text).strip()
+    iso = re.search(r"\b(20\d{2})-(\d{1,2})-(\d{1,2})\b", text)
+    if iso:
+        try:
+            return datetime(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)), tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    m = re.search(r"\b(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{2,4})\b", text)
+    if not m:
+        return None
+    day = int(m.group(1))
+    month = _MONTHS.get(m.group(2).lower())
+    year = int(m.group(3))
+    if year < 100:
+        year += 2000
+    if not month:
+        return None
+    try:
+        return datetime(year, month, day, tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _hard_stop(analysis: dict[str, Any], name: str) -> dict[str, Any]:
+    stops = analysis.setdefault("hard_stops", [])
+    if not isinstance(stops, list):
+        stops = []
+        analysis["hard_stops"] = stops
+    for item in stops:
+        if isinstance(item, dict) and clean_text(item.get("name"), "") == name:
+            return item
+    item = {"name": name, "status": "not_checked", "evidence": ""}
+    stops.append(item)
+    return item
+
+
+def enforce_core_guardrails(analysis: dict[str, Any]) -> dict[str, Any]:
+    """Deterministic corrections for expiry, theta and break-even semantics."""
+    positions = analysis.get("positions")
+    if not isinstance(positions, list) or not positions:
+        return analysis
+    position = positions[0] if isinstance(positions[0], dict) else {}
+    expiration_value = (position.get("expiration") or {}).get("value")
+    expiry = parse_expiration_date(expiration_value)
+    today = datetime.now(timezone.utc).date()
+    days: int | None = (expiry.date() - today).days if expiry else None
+    analysis["days_to_expiration"] = days
+
+    near = _hard_stop(analysis, "near_expiration")
+    if days is None:
+        near.update(status="not_checked", evidence="Дату експірації не вдалося надійно розібрати.")
+    elif days < 0:
+        near.update(status="triggered", evidence=f"Експірація минула {-days} дн. тому; дані можуть бути застарілими.")
+    elif days <= 14:
+        near.update(status="triggered", evidence=f"До експірації {days} дн.; часовий розпад прискорюється.")
+    else:
+        near.update(status="clear", evidence=f"До експірації {days} дн.")
+
+    guardian = analysis.setdefault("guardian", {})
+    if not isinstance(guardian, dict):
+        guardian = {}
+        analysis["guardian"] = guardian
+
+    break_even = safe_float((position.get("break_even") or {}).get("value"))
+    theta = safe_float((position.get("theta") or {}).get("value"))
+    quantity = safe_float((position.get("quantity") or {}).get("value"))
+    market_value = safe_float((position.get("market_value") or {}).get("value"))
+    theta_daily = abs(theta) * quantity * 100 if theta is not None and quantity is not None else None
+    theta_pct = (theta_daily / market_value * 100) if theta_daily is not None and market_value else None
+
+    if days is not None and days <= 14:
+        guardian["risk"] = "high"
+        if clean_text(guardian.get("thesis_status"), "unknown") not in {"broken"}:
+            guardian["thesis_status"] = "weakening"
+        guardian["one_action"] = (
+            "Не збільшувати позицію; спочатку визначити технічний рівень інвалідації по графіку SOFI."
+        )
+        guardian["why_short"] = (
+            f"До експірації лише {days} дн., тому Theta-ризик підвищений. "
+            "Break-even на експірацію не є поточним стоп-рівнем."
+        )
+
+    if break_even is not None:
+        guardian["invalidation"] = (
+            f"Не визначено: ${break_even:.2f} — break-even на експірацію, а не поточний стоп. "
+            "Потрібен технічний рівень по графіку або чітка торгова теза."
+        )
+
+    details = []
+    if days is not None:
+        details.append(f"Факт: до експірації {days} дн.")
+    if theta_daily is not None:
+        theta_text = f"приблизно ${theta_daily:.2f}/день для {int(quantity or 0)} контрактів"
+        if theta_pct is not None:
+            theta_text += f" (~{theta_pct:.1f}% поточної вартості позиції за день за незмінних інших умов)"
+        details.append("Оцінка Theta: " + theta_text + "; Theta змінюється з ринком.")
+    if break_even is not None:
+        details.append(f"${break_even:.2f} — беззбитковість на дату експірації, не інвалідація сьогодні.")
+
+    why = clean_text(guardian.get("why_full"), "")
+    why = re.sub(r"тривал(ий|ого|ому|им)?\s+термін\s+експірації", "короткий термін до експірації", why, flags=re.I)
+    if days is not None and days <= 14:
+        why = re.sub(r"ризик(и)?\s+середн(і|ій|ього|ьому|ім)", "ризик підвищений", why, flags=re.I)
+    why = re.sub(r"експіраці(я|ї)\s+[^.]{0,40}(далек|distant)[^.]*\.?", "", why, flags=re.I)
+    guardian["why_full"] = " ".join(details + ([why] if why else [])).strip()
+
+    note = clean_text(analysis.get("note"), "")
+    deterministic_note = (
+        "CORE FIX: строк до експірації та значення break-even перевірені кодом, а не лише мовною моделлю."
+    )
+    analysis["note"] = (note + " " + deterministic_note).strip()
+    return analysis
+
+
 async def analyze_screenshot(image_path: Path, caption: str = "") -> dict[str, Any]:
     image_base64 = encode_image(image_path)
     response = await openai_client.responses.create(
@@ -703,6 +846,10 @@ async def analyze_screenshot(image_path: Path, caption: str = "") -> dict[str, A
                 "role": "user",
                 "content": [
                     {"type": "input_text", "text": SCREENSHOT_ANALYSIS_PROMPT},
+                    {
+                        "type": "input_text",
+                        "text": f"Сьогодні UTC: {datetime.now(timezone.utc).date().isoformat()}",
+                    },
                     {
                         "type": "input_text",
                         "text": f"Підпис користувача: {caption or 'немає'}",
@@ -716,7 +863,8 @@ async def analyze_screenshot(image_path: Path, caption: str = "") -> dict[str, A
         ],
         max_output_tokens=2400,
     )
-    return extract_json_object(response.output_text)
+    analysis = extract_json_object(response.output_text)
+    return enforce_core_guardrails(analysis)
 
 
 async def summarize_webull(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -935,6 +1083,11 @@ def format_analysis(analysis: dict[str, Any]) -> str:
                 f"📌 Інструмент: {clean_text(position.get('instrument'))}",
                 f"🎯 Страйк: {value_with_source(position.get('strike'), 'money')}",
                 f"📅 Експірація: {value_with_source(position.get('expiration'))}",
+                (
+                    f"⏳ До експірації: {analysis.get('days_to_expiration')} дн."
+                    if analysis.get("days_to_expiration") is not None
+                    else "⏳ До експірації: не визначено"
+                ),
                 f"📦 Кількість: {value_with_source(position.get('quantity'))}",
                 f"💰 Вхід: {value_with_source(position.get('entry_price'), 'money')}",
                 f"💳 Total Cost: {value_with_source(position.get('total_cost'), 'money')}",
@@ -1102,7 +1255,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         else "⚠️ Пам’ять: тимчасова — потрібен Railway Volume"
     )
     await update.message.reply_text(
-        "🦁 SAFARI 1.3 на зв’язку.\n\n"
+        "🦁 SAFARI 1.4 CORE FIX на зв’язку.\n\n"
         "Тільки читання, аналіз і рекомендації. Автоматичних угод немає.\n\n"
         "Команди:\n"
         "• надішли скріншот — VISION + TRADING/GUARDIAN\n"
@@ -1455,7 +1608,7 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     status = await update.message.reply_text(
-        "🦁 SAFARI 1.2\n\n👁️ Читаю дані й спочатку шукаю причини проти…"
+        "🦁 SAFARI 1.4 CORE FIX\n\n👁️ Читаю дані й спочатку шукаю причини проти…"
     )
 
     destination: Path | None = None

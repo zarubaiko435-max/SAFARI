@@ -1,36 +1,14 @@
-# 🦁 SAFARI 1.3 MEMORY BRIDGE
+# 🦁 SAFARI 1.4 CORE FIX
 
-Read-only Telegram trading copilot. No order placement, replacement, cancellation, or execution calls.
+A minimal, practical upgrade over SAFARI 1.3 VERIFIED.
 
-## Webull safety changes
+## What changed
+- Calculates days to option expiration in code.
+- Flags 0–14 days as near expiration.
+- Estimates daily Theta exposure across all contracts.
+- Never treats expiry break-even as today's stop/invalidation.
+- Keeps WAIT/HOLD/REDUCE/EXIT advisory only; no trade execution.
+- Hides verbose HTTP request URLs from logs.
 
-- Every Webull endpoint is attempted exactly once.
-- No automatic retries or background polling.
-- SDK `ServerException` / HTTP 429 errors are mapped to a clear Telegram message.
-- Every API operation is named in Railway logs.
-- Account list, positions, and balance calls are spaced by 2.2 seconds by default.
-- The exact operation that returned 429 is shown in Telegram.
-
-## Railway variables
-
-Required:
-
-- `TELEGRAM_BOT_TOKEN`
-- `OPENAI_API_KEY`
-- `WEBULL_APP_KEY`
-- `WEBULL_APP_SECRET`
-
-Optional:
-
-- `WEBULL_INTERCALL_DELAY_SECONDS` — default `2.2`
-- `WEBULL_LOCAL_COOLDOWN_SECONDS` — default `15`
-- `RAILWAY_VOLUME_MOUNT_PATH` — Railway normally sets this for the attached volume
-
-## Safe test
-
-After deployment is Active, send `WEBULL` exactly once. If Webull returns 429, do not repeat it. The bot response and Railway logs will identify the exact failed operation.
-
-
-## Memory bridge
-
-After a successful `WEBULL` read, live positions are saved into GUARDIAN local memory. `МОЇ ПОЗИЦІЇ` shows the latest saved positions, and `ЧОМУ?` can use the latest Webull reasoning. Webull remains read-only; no automatic retries are added.
+## Safety
+Read-only. No order placement, modification, cancellation, or execution calls.
