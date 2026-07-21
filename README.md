@@ -1,24 +1,17 @@
-# 🦁 SAFARI 1.4.1 DATA GUARD
+# 🦁 SAFARI 1.4.1 CLEANUP PATCH
 
-A small safety patch for the existing read-only SAFARI Telegram trading assistant.
+A minimal maintenance patch for the existing read-only SAFARI 1.4.1 DATA GUARD deployment.
 
-## Purpose
+## Changes
 
-Prevent two specific screenshot-analysis errors:
-
-1. Old or undated screenshots being treated as current market data.
-2. Bid/Ask size being mislabeled as Open Interest/Volume.
-
-## Freshness rule
-
-- A full date visible inside the trading app can confirm freshness.
-- A phone status-bar clock cannot confirm freshness.
-- When no full in-app date is visible, caption a genuinely current screenshot with `СВІЖИЙ` or `LIVE`.
-- Without confirmation, SAFARI returns `WAIT` and does not save that screenshot as an active GUARDIAN position.
+- Fixes the screenshot-analysis start label to `SAFARI 1.4.1 DATA GUARD`.
+- Adds the Telegram command `ОЧИСТИТИ ДУБЛІ`.
+- That command removes only legacy positions whose source is `screenshot`.
+- Live positions whose source is `Webull OpenAPI` are preserved.
 
 ## Safety
 
 - READ ONLY.
-- No order placement, change, cancellation, or closing.
-- No automatic Webull retries.
-- Existing persistent memory under `/data` remains unchanged.
+- No order placement, modification, cancellation, or closing.
+- Cleanup changes only local GUARDIAN memory under `/data`.
+- The command reports how many screenshot entries were removed and how many Webull positions were preserved.

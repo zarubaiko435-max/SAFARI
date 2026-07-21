@@ -1365,6 +1365,44 @@ def format_analysis(analysis: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def remove_screenshot_position_duplicates(user_id: int) -> tuple[int, int]:
+    """Remove only legacy screenshot-sourced GUARDIAN entries.
+
+    Live Webull OpenAPI positions are never removed by this cleanup.
+    Returns (removed_screenshot_entries, preserved_webull_entries).
+    """
+    user = state_store.user(user_id)
+    positions = user.get("positions", {})
+    if not isinstance(positions, dict):
+        return 0, 0
+
+    screenshot_keys = [
+        key
+        for key, item in positions.items()
+        if isinstance(item, dict) and item.get("source") == "screenshot"
+    ]
+    preserved_webull = sum(
+        1
+        for item in positions.values()
+        if isinstance(item, dict) and item.get("source") == "Webull OpenAPI"
+    )
+
+    for key in screenshot_keys:
+        positions.pop(key, None)
+
+    if screenshot_keys:
+        user["positions"] = positions
+        state_store.update_user(user_id, user)
+        logger.info(
+            "GUARDIAN_MEMORY cleanup removed_screenshot=%s preserved_webull=%s user=%s",
+            len(screenshot_keys),
+            preserved_webull,
+            user_id,
+        )
+
+    return len(screenshot_keys), preserved_webull
+
+
 def format_local_positions(user_id: int) -> str:
     user = state_store.user(user_id)
     positions = user.get("positions", {})
@@ -1448,6 +1486,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• WEBULL CHECK — одна перевірка підтвердження\n"
         "• WEBULL — живі позиції після авторизації (з паузами між API-викликами)\n"
         "• МОЇ ПОЗИЦІЇ — локальна пам’ять\n"
+        "• ОЧИСТИТИ ДУБЛІ — видалити лише старі screenshot-записи\n"
         "• ЧОМУ? — повне пояснення\n"
         "• ДОСЬЄ — журнал завершених угод\n"
         "• ЗАКРИВ SOFI ... — записати завершену угоду\n\n"
@@ -1754,6 +1793,30 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
+    if normalized in {
+        "очистити дублі",
+        "очистити дублікати",
+        "прибрати дублі",
+        "cleanup duplicates",
+    }:
+        removed, preserved = remove_screenshot_position_duplicates(
+            update.effective_user.id
+        )
+        if removed:
+            await update.message.reply_text(
+                "🧹 SAFARI GUARDIAN — ОЧИЩЕНО ✅\n\n"
+                f"Видалено старих записів зі скрінів: {removed}.\n"
+                f"Живих позицій Webull збережено: {preserved}.\n\n"
+                "Жодних торгових дій не виконано."
+            )
+        else:
+            await update.message.reply_text(
+                "🧹 SAFARI GUARDIAN\n\n"
+                "Старих записів зі скрінів не знайдено. "
+                f"Живих позицій Webull: {preserved}."
+            )
+        return
+
     if normalized in {"чому", "чому?", "why", "why?"}:
         await why_message(update, context)
         return
@@ -1793,7 +1856,7 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     status = await update.message.reply_text(
-        "🦁 SAFARI 1.4 CORE FIX\n\n👁️ Читаю дані й спочатку шукаю причини проти…"
+        "🦁 SAFARI 1.4.1 DATA GUARD\n\n👁️ Читаю дані й спочатку шукаю причини проти…"
     )
 
     destination: Path | None = None

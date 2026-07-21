@@ -1,0 +1,10 @@
+SAFARI 1.4.1 CLEANUP PATCH
+
+Lean maintenance fix only.
+
+Changes:
+- Corrects the screenshot-analysis start label from SAFARI 1.4 CORE FIX to SAFARI 1.4.1 DATA GUARD.
+- Adds command: ОЧИСТИТИ ДУБЛІ.
+- Removes only legacy GUARDIAN entries with source=screenshot.
+- Preserves all source=Webull OpenAPI positions.
+- Preserves READ ONLY mode, Data Guard, Webull rate-limit safety, and Railway Volume memory.
