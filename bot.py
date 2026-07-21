@@ -1,4 +1,4 @@
-"""SAFARI 1.4.2 MERGE FIX — one-position memory merge, read-only trading copilot.
+"""SAFARI 1.4.3 SOURCE BRIDGE — one-position memory merge, read-only trading copilot.
 
 Safety contract:
 - Reads screenshots and Webull account/position data.
@@ -73,6 +73,7 @@ STATE_FILE = DATA_DIR / "safari_state.json"
 
 MAX_TELEGRAM_MESSAGE = 3900
 READ_ONLY_MODE = True
+WEBULL_IDENTITY_FIELDS = {"strike", "expiration", "quantity", "entry_price", "total_cost"}
 PERSISTENT_STORAGE = bool(os.getenv("RAILWAY_VOLUME_MOUNT_PATH"))
 WEBULL_LOCAL_COOLDOWN_SECONDS = int(os.getenv("WEBULL_LOCAL_COOLDOWN_SECONDS", "15"))
 WEBULL_INTERCALL_DELAY_SECONDS = float(os.getenv("WEBULL_INTERCALL_DELAY_SECONDS", "2.2"))
@@ -199,6 +200,7 @@ class JsonStateStore:
         self.lock = Lock()
         self.data: dict[str, Any] = {"users": {}}
         self._load()
+        self._migrate_source_bridge()
 
     def _load(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -210,6 +212,35 @@ class JsonStateStore:
                 self.data = loaded
         except Exception as error:
             logger.warning("Could not load state file: %s", error)
+
+    def _migrate_source_bridge(self) -> None:
+        """Repair provenance labels for Webull-backed position identity fields."""
+        changed = False
+        users = self.data.get("users", {})
+        if not isinstance(users, dict):
+            return
+        for user in users.values():
+            if not isinstance(user, dict):
+                continue
+            positions = user.get("positions", {})
+            if not isinstance(positions, dict):
+                continue
+            for item in positions.values():
+                if not isinstance(item, dict) or item.get("source") != "Webull OpenAPI":
+                    continue
+                position = item.get("position")
+                if not isinstance(position, dict):
+                    continue
+                for field_name in WEBULL_IDENTITY_FIELDS:
+                    field = position.get(field_name)
+                    if isinstance(field, dict) and field.get("value") not in (None, ""):
+                        if field.get("source") != "api":
+                            field["source"] = "api"
+                            changed = True
+        if changed:
+            with self.lock:
+                self._save_locked()
+            logger.info("SOURCE_BRIDGE migrated Webull identity provenance")
 
     def _save_locked(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -534,7 +565,7 @@ webull_last_request_monotonic = 0.0
 # ---------------------------------------------------------------------------
 
 SCREENSHOT_ANALYSIS_PROMPT = r"""
-Ти — 🦁 SAFARI 1.4.2 MERGE FIX, read-only Trading Copilot.
+Ти — 🦁 SAFARI 1.4.3 SOURCE BRIDGE, read-only Trading Copilot.
 Ти НІКОЛИ не відкриваєш, не змінюєш і не закриваєш угоди. Лише читаєш,
 аналізуєш і даєш рекомендацію, остаточне рішення завжди за трейдером.
 
@@ -1165,8 +1196,10 @@ def _field_is_present(field: Any) -> bool:
 def _merge_position_fields(
     existing: dict[str, Any],
     fresh: dict[str, Any],
+    *,
+    preserve_webull_identity: bool = False,
 ) -> dict[str, Any]:
-    """Overlay visible fresh fields while retaining API identity when missing."""
+    """Overlay fresh market fields while preserving Webull position identity."""
     merged = deepcopy(existing)
     for name, value in fresh.items():
         if name in {"ticker", "instrument"}:
@@ -1177,10 +1210,22 @@ def _merge_position_fields(
             if isinstance(value, dict):
                 merged[name] = deepcopy(value)
             continue
+        if (
+            preserve_webull_identity
+            and name in WEBULL_IDENTITY_FIELDS
+            and _field_is_present(merged.get(name))
+        ):
+            continue
         if _field_is_present(value):
             merged[name] = deepcopy(value)
         elif name not in merged:
             merged[name] = deepcopy(value)
+
+    if preserve_webull_identity:
+        for field_name in WEBULL_IDENTITY_FIELDS:
+            field = merged.get(field_name)
+            if isinstance(field, dict) and field.get("value") not in (None, ""):
+                field["source"] = "api"
     return merged
 
 
@@ -1227,9 +1272,11 @@ def update_state_from_analysis(user_id: int, analysis: dict[str, Any]) -> None:
 
                 if preferred is not None:
                     existing_position = preferred.get("position", {})
+                    preferred_is_webull = preferred.get("source") == "Webull OpenAPI"
                     merged_position = _merge_position_fields(
                         existing_position if isinstance(existing_position, dict) else {},
                         position,
+                        preserve_webull_identity=preferred_is_webull,
                     )
                     source = (
                         "Webull OpenAPI"
@@ -1560,6 +1607,8 @@ def format_local_positions(user_id: int) -> str:
                 f"({value_with_source(position.get('pnl_percent'), 'percent')})",
                 f"🛡 {clean_text(guardian.get('decision'), 'WAIT')} | "
                 f"ризик {clean_text(guardian.get('risk'), 'unknown')}",
+                f"🔗 Позиція: {'Webull' if item.get('source') == 'Webull OpenAPI' else 'скрін'} | "
+                f"ринок: {'свіжий скрін' if item.get('market_data_source') == 'fresh screenshot' else 'Webull'}",
                 f"🕒 {clean_text(item.get('updated_at_utc'))}",
             ]
         )
@@ -1607,7 +1656,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         else "⚠️ Пам’ять: тимчасова — потрібен Railway Volume"
     )
     await update.message.reply_text(
-        "🦁 SAFARI 1.4.2 MERGE FIX на зв’язку.\n\n"
+        "🦁 SAFARI 1.4.3 SOURCE BRIDGE на зв’язку.\n\n"
         "Тільки читання, аналіз і рекомендації. Автоматичних угод немає.\n\n"
         "Команди:\n"
         "• надішли скріншот — VISION + TRADING/GUARDIAN\n"
@@ -1985,7 +2034,7 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     status = await update.message.reply_text(
-        "🦁 SAFARI 1.4.1 DATA GUARD\n\n👁️ Читаю дані й спочатку шукаю причини проти…"
+        "🦁 SAFARI 1.4.3 SOURCE BRIDGE\n\n👁️ Читаю дані й спочатку шукаю причини проти…"
     )
 
     destination: Path | None = None
@@ -2051,7 +2100,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
 
     logger.info(
-        "SAFARI 1.4.2 MERGE FIX started | read_only=%s | webull_configured=%s | data_dir=%s",
+        "SAFARI 1.4.3 SOURCE BRIDGE started | read_only=%s | webull_configured=%s | data_dir=%s",
         READ_ONLY_MODE,
         bool(WEBULL_APP_KEY and WEBULL_APP_SECRET),
         DATA_DIR,

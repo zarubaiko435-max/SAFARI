@@ -1,0 +1,14 @@
+SAFARI 1.4.3 SOURCE BRIDGE
+
+FIXED
+- Preserves Webull as the authoritative source for contract identity:
+  strike, expiration, quantity, entry price, and total cost.
+- Fresh screenshots update market fields without replacing Webull provenance:
+  premium, market value, P/L, bid/ask, Greeks, IV, and related live values.
+- Repairs already-saved Webull-backed positions on startup.
+- Shows explicit position source and market-data source in МОЇ ПОЗИЦІЇ.
+- Corrects the screenshot processing banner to SAFARI 1.4.3 SOURCE BRIDGE.
+
+SAFETY
+- READ ONLY remains enabled.
+- No trade opening, modification, cancellation, or closing actions were added.

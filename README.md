@@ -1,4 +1,4 @@
-# 🦁 SAFARI 1.4.2 MERGE FIX
+# 🦁 SAFARI 1.4.3 SOURCE BRIDGE
 
 A lean memory-correction patch for the read-only SAFARI GUARDIAN.
 
@@ -19,3 +19,7 @@ A lean memory-correction patch for the read-only SAFARI GUARDIAN.
 - No order placement, modification, cancellation, or closing.
 - Changes only local GUARDIAN memory under `/data`.
 - DATA GUARD, rate-limit safety, and persistent Railway Volume memory remain enabled.
+
+
+## 1.4.3 Source Bridge
+Webull remains the source of position identity, while a user-confirmed fresh screenshot may update current market fields. READ ONLY.
