@@ -1,51 +1,41 @@
-"""SAFARI 1.4.3 SOURCE BRIDGE — one-position memory merge, read-only trading copilot.
-
-Safety contract:
-- Reads screenshots and Webull account/position data.
-- Produces analysis and recommendations only.
-- Contains no order placement, replacement, cancellation, or execution calls.
-"""
+"""🦁 SAFARI 1.5.0 STABILITY CORE — deterministic ingress, read-only trading copilot."""
 
 from __future__ import annotations
 
 import asyncio
-import base64
-import json
 import logging
 import os
-import re
 import tempfile
 import time
-from copy import deepcopy
-from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
-from threading import Lock
 from typing import Any
 
-from openai import AsyncOpenAI
 from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+
+from safari_ai import SafariAI
+from safari_core import (
+    READ_ONLY_MODE,
+    SAFARI_VERSION,
+    JsonStateStore,
+    PendingIntent,
+    build_analysis,
+    clean_text,
+    format_analysis,
+    format_dossier,
+    format_local_positions,
+    make_pending_intent,
+    money,
+    percentage,
+    remove_screenshot_position_duplicates,
+    route_envelope,
+    startup_self_check,
+    update_state_from_analysis,
+    update_state_from_webull,
+    utc_now,
 )
-
-try:
-    from webull.core.client import ApiClient, ClientException, ServerException
-    from webull.core.http.initializer.token.token_manager import TokenManager
-    from webull.core.http.initializer.token.token_operation import TokenOperation
-    from webull.trade.trade.v2.account_info_v2 import AccountV2
-except ImportError:  # Screenshot mode remains available if the SDK is missing.
-    ApiClient = None  # type: ignore[assignment]
-    ClientException = None  # type: ignore[assignment]
-    ServerException = None  # type: ignore[assignment]
-    TokenManager = None  # type: ignore[assignment]
-    TokenOperation = None  # type: ignore[assignment]
-    AccountV2 = None  # type: ignore[assignment]
-
-
+from safari_webull import WebullReadOnly, WebullReadOnlyError
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -54,26 +44,16 @@ except ImportError:  # Screenshot mode remains available if the SDK is missing.
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
-
 WEBULL_APP_KEY = os.getenv("WEBULL_APP_KEY", "").strip()
 WEBULL_APP_SECRET = os.getenv("WEBULL_APP_SECRET", "").strip()
 WEBULL_REGION = os.getenv("WEBULL_REGION", "us").strip() or "us"
 WEBULL_ENDPOINT = os.getenv("WEBULL_ENDPOINT", "api.webull.com").strip()
-
-# If a Railway volume is attached later, Railway exposes its mount path.
-# Until then, state survives normal runtime restarts but may not survive redeploys.
-DATA_DIR = Path(
-    os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
-    or os.getenv("SAFARI_DATA_DIR")
-    or "data"
-)
+USER_TIMEZONE = os.getenv("SAFARI_USER_TIMEZONE", "America/Los_Angeles").strip()
+DATA_DIR = Path(os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or os.getenv("SAFARI_DATA_DIR") or "data")
 SCREENSHOT_DIR = DATA_DIR / "screenshots"
 WEBULL_TOKEN_DIR = DATA_DIR / "webull_token"
 STATE_FILE = DATA_DIR / "safari_state.json"
-
 MAX_TELEGRAM_MESSAGE = 3900
-READ_ONLY_MODE = True
-WEBULL_IDENTITY_FIELDS = {"strike", "expiration", "quantity", "entry_price", "total_cost"}
 PERSISTENT_STORAGE = bool(os.getenv("RAILWAY_VOLUME_MOUNT_PATH"))
 WEBULL_LOCAL_COOLDOWN_SECONDS = int(os.getenv("WEBULL_LOCAL_COOLDOWN_SECONDS", "15"))
 WEBULL_INTERCALL_DELAY_SECONDS = float(os.getenv("WEBULL_INTERCALL_DELAY_SECONDS", "2.2"))
@@ -87,84 +67,29 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("safari")
 
-openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+state_store = JsonStateStore(STATE_FILE)
+safari_ai = SafariAI(OPENAI_API_KEY, OPENAI_MODEL) if OPENAI_API_KEY else None
+webull_reader: WebullReadOnly | None
+try:
+    webull_reader = WebullReadOnly(
+        app_key=WEBULL_APP_KEY,
+        app_secret=WEBULL_APP_SECRET,
+        token_dir=WEBULL_TOKEN_DIR,
+        region=WEBULL_REGION,
+        endpoint=WEBULL_ENDPOINT,
+        intercall_delay_seconds=WEBULL_INTERCALL_DELAY_SECONDS,
+    )
+except Exception as error:
+    logger.exception("Webull initialization failed: %s", error)
+    webull_reader = None
+
+webull_operation_lock = asyncio.Lock()
+webull_last_request_monotonic = 0.0
 
 
 # ---------------------------------------------------------------------------
-# Small utilities
+# Utilities
 # ---------------------------------------------------------------------------
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def clean_text(value: Any, default: str = "не видно") -> str:
-    if value is None:
-        return default
-    text = str(value).strip()
-    return text if text else default
-
-
-def safe_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    text = str(value).strip().replace(",", "").replace("$", "").replace("%", "")
-    if not text or text.lower() in {"none", "null", "n/a", "na", "не видно"}:
-        return None
-    match = re.search(r"[-+]?\d+(?:\.\d+)?", text)
-    if not match:
-        return None
-    try:
-        return float(match.group(0))
-    except ValueError:
-        return None
-
-
-def money(value: Any, default: str = "не видно") -> str:
-    number = safe_float(value)
-    return default if number is None else f"${number:,.2f}"
-
-
-def percentage(value: Any, default: str = "не видно") -> str:
-    number = safe_float(value)
-    return default if number is None else f"{number:+.2f}%"
-
-
-def encode_image(image_path: Path) -> str:
-    with image_path.open("rb") as image_file:
-        return base64.b64encode(image_file.read()).decode("utf-8")
-
-
-def extract_json_object(raw: str) -> dict[str, Any]:
-    """Parse strict JSON or recover the first JSON object from fenced output."""
-    text = raw.strip()
-    if not text:
-        raise ValueError("Empty model response")
-
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, dict):
-            return parsed
-    except json.JSONDecodeError:
-        pass
-
-    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if fenced:
-        parsed = json.loads(fenced.group(1))
-        if isinstance(parsed, dict):
-            return parsed
-
-    start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end > start:
-        parsed = json.loads(text[start : end + 1])
-        if isinstance(parsed, dict):
-            return parsed
-
-    raise ValueError("No JSON object in model response")
 
 
 async def send_long_message(message: Any, text: str) -> None:
@@ -172,1477 +97,95 @@ async def send_long_message(message: Any, text: str) -> None:
     if len(text) <= MAX_TELEGRAM_MESSAGE:
         await message.reply_text(text)
         return
-
-    chunks: list[str] = []
     remaining = text
     while remaining:
         if len(remaining) <= MAX_TELEGRAM_MESSAGE:
-            chunks.append(remaining)
-            break
+            await message.reply_text(remaining)
+            return
         split_at = remaining.rfind("\n", 0, MAX_TELEGRAM_MESSAGE)
         if split_at < 1000:
             split_at = MAX_TELEGRAM_MESSAGE
-        chunks.append(remaining[:split_at])
+        await message.reply_text(remaining[:split_at])
         remaining = remaining[split_at:].lstrip()
 
-    for chunk in chunks:
-        await message.reply_text(chunk)
 
-
-# ---------------------------------------------------------------------------
-# Persistent local state
-# ---------------------------------------------------------------------------
-
-
-class JsonStateStore:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.lock = Lock()
-        self.data: dict[str, Any] = {"users": {}}
-        self._load()
-        self._migrate_source_bridge()
-
-    def _load(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.path.exists():
-            return
-        try:
-            loaded = json.loads(self.path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict) and isinstance(loaded.get("users"), dict):
-                self.data = loaded
-        except Exception as error:
-            logger.warning("Could not load state file: %s", error)
-
-    def _migrate_source_bridge(self) -> None:
-        """Repair provenance labels for Webull-backed position identity fields."""
-        changed = False
-        users = self.data.get("users", {})
-        if not isinstance(users, dict):
-            return
-        for user in users.values():
-            if not isinstance(user, dict):
-                continue
-            positions = user.get("positions", {})
-            if not isinstance(positions, dict):
-                continue
-            for item in positions.values():
-                if not isinstance(item, dict) or item.get("source") != "Webull OpenAPI":
-                    continue
-                position = item.get("position")
-                if not isinstance(position, dict):
-                    continue
-                for field_name in WEBULL_IDENTITY_FIELDS:
-                    field = position.get(field_name)
-                    if isinstance(field, dict) and field.get("value") not in (None, ""):
-                        if field.get("source") != "api":
-                            field["source"] = "api"
-                            changed = True
-        if changed:
-            with self.lock:
-                self._save_locked()
-            logger.info("SOURCE_BRIDGE migrated Webull identity provenance")
-
-    def _save_locked(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=self.path.parent,
-            delete=False,
-            prefix="safari_state_",
-            suffix=".tmp",
-        ) as temp_file:
-            json.dump(self.data, temp_file, ensure_ascii=False, indent=2)
-            temp_name = temp_file.name
-        os.replace(temp_name, self.path)
-
-    def user(self, user_id: int | str) -> dict[str, Any]:
-        key = str(user_id)
-        with self.lock:
-            users = self.data.setdefault("users", {})
-            user = users.setdefault(
-                key,
-                {
-                    "positions": {},
-                    "dossier": [],
-                    "last_analysis": None,
-                    "last_full_reason": "",
-                },
-            )
-            return deepcopy(user)
-
-    def update_user(self, user_id: int | str, user_data: dict[str, Any]) -> None:
-        key = str(user_id)
-        with self.lock:
-            self.data.setdefault("users", {})[key] = deepcopy(user_data)
-            self._save_locked()
-
-
-state_store = JsonStateStore(STATE_FILE)
-
-
-# ---------------------------------------------------------------------------
-# Webull read-only integration
-# ---------------------------------------------------------------------------
-
-
-class WebullReadOnlyError(RuntimeError):
-    def __init__(self, code: str, message: str) -> None:
-        self.code = code
-        super().__init__(message)
-
-
-class WebullReadOnly:
-    """Manual one-request auth flow plus read-only account access.
-
-    This class deliberately avoids TradeClient construction because that
-    constructor starts the SDK token polling loop. Each Telegram command below
-    performs at most one explicit token operation.
-    """
-
-    def __init__(self) -> None:
-        self.enabled = bool(WEBULL_APP_KEY and WEBULL_APP_SECRET)
-        self.api_client: Any = None
-        self.token_manager: Any = None
-        self.token_operation: Any = None
-        self.account_v2: Any = None
-
-        if not self.enabled:
-            return
-        if any(item is None for item in (ApiClient, TokenManager, TokenOperation, AccountV2)):
-            raise WebullReadOnlyError("SDK_MISSING", "Webull SDK is not installed")
-
-        WEBULL_TOKEN_DIR.mkdir(parents=True, exist_ok=True)
-        api_client = ApiClient(WEBULL_APP_KEY, WEBULL_APP_SECRET, WEBULL_REGION)
-        api_client.add_endpoint(WEBULL_REGION, WEBULL_ENDPOINT)
-        api_client.set_token_dir(str(WEBULL_TOKEN_DIR))
-
-        self.api_client = api_client
-        self.token_manager = TokenManager(str(WEBULL_TOKEN_DIR))
-        self.token_operation = TokenOperation(api_client)
-        self.account_v2 = AccountV2(api_client)
-
-    @staticmethod
-    def _raise_mapped_sdk_error(error: Exception, operation: str) -> None:
-        """Convert SDK exceptions into stable SAFARI error codes. Never retries."""
-        http_status = getattr(error, "http_status", None)
-        error_code = clean_text(getattr(error, "error_code", None), "").upper()
-        error_msg = clean_text(getattr(error, "error_msg", None), str(error))
-        request_id = clean_text(getattr(error, "request_id", None), "")
-        combined = f"{error_code} {error_msg}".upper()
-
-        logger.warning(
-            "WEBULL_API_ERROR operation=%s http_status=%s error_code=%s request_id=%s",
-            operation,
-            http_status,
-            error_code or "UNKNOWN",
-            request_id or "NONE",
-        )
-
-        if http_status == 429 or "TOO_MANY_REQUESTS" in combined or "TOO MANY REQUESTS" in combined:
-            raise WebullReadOnlyError(
-                "RATE_LIMIT",
-                f"{operation}: Webull rate limit (429)",
-            ) from error
-        if http_status == 417 or "INVALID_TOKEN" in combined:
-            raise WebullReadOnlyError(
-                "INVALID_TOKEN",
-                f"{operation}: token invalid or expired",
-            ) from error
-        if http_status in {401, 403} or "UNAUTHORIZED" in combined:
-            raise WebullReadOnlyError(
-                "UNAUTHORIZED",
-                f"{operation}: unauthorized ({http_status or 'unknown'})",
-            ) from error
-        raise WebullReadOnlyError(
-            "SDK_ERROR",
-            f"{operation}: {error_msg}",
-        ) from error
-
-    def _api_call(self, operation: str, function: Any, *args: Any) -> Any:
-        """Perform exactly one SDK call with explicit operation logging. Never retries."""
-        logger.info("WEBULL_API_CALL start operation=%s", operation)
-        try:
-            response = function(*args)
-        except Exception as error:
-            self._raise_mapped_sdk_error(error, operation)
-            raise  # Unreachable; keeps static analyzers satisfied.
-        logger.info(
-            "WEBULL_API_CALL finish operation=%s status=%s",
-            operation,
-            getattr(response, "status_code", "unknown"),
-        )
-        return response
-
-    @staticmethod
-    def _wait_between_calls() -> None:
-        """Space distinct Webull reads; this is a delay, not an automatic retry."""
-        if WEBULL_INTERCALL_DELAY_SECONDS > 0:
-            time.sleep(WEBULL_INTERCALL_DELAY_SECONDS)
-
-    @staticmethod
-    def _response_json(response: Any, operation: str) -> Any:
-        status_code = getattr(response, "status_code", None)
-        if status_code != 200:
-            body = clean_text(getattr(response, "text", ""), "невідома помилка")
-            upper = body.upper()
-            if status_code == 429 or "TOO_MANY_REQUESTS" in upper:
-                raise WebullReadOnlyError("RATE_LIMIT", f"{operation}: Webull rate limit (429)")
-            if status_code == 417 or "INVALID_TOKEN" in upper:
-                raise WebullReadOnlyError("INVALID_TOKEN", f"{operation}: token invalid or expired")
-            if status_code in {401, 403}:
-                raise WebullReadOnlyError("UNAUTHORIZED", f"{operation}: unauthorized ({status_code})")
-            raise WebullReadOnlyError("HTTP_ERROR", f"{operation}: HTTP {status_code}")
-        try:
-            return response.json()
-        except Exception as error:
-            raise WebullReadOnlyError("INVALID_JSON", f"{operation}: invalid JSON response") from error
-
-    @staticmethod
-    def _validate_token_payload(payload: Any, operation: str) -> dict[str, Any]:
-        if not isinstance(payload, dict):
-            raise WebullReadOnlyError("TOKEN_RESPONSE", f"{operation}: empty token response")
-        token = payload.get("token")
-        status = clean_text(payload.get("status"), "UNKNOWN").upper()
-        expires = payload.get("expires")
-        if not token or status == "UNKNOWN":
-            raise WebullReadOnlyError("TOKEN_RESPONSE", f"{operation}: incomplete token response")
-        return {"token": str(token), "status": status, "expires": expires}
-
-    def _load_local_token(self) -> dict[str, Any] | None:
-        local = self.token_manager.load_token_from_local()
-        if local is None:
-            return None
-        return {
-            "token": clean_text(getattr(local, "token", None), ""),
-            "expires": getattr(local, "expires", None),
-            "status": clean_text(getattr(local, "status", None), "UNKNOWN").upper(),
-        }
-
-    def _save_token(self, token_data: dict[str, Any]) -> None:
-        self.token_manager.save_token_to_local(token_data)
-        if token_data.get("status") == "NORMAL":
-            self.api_client.set_token(token_data["token"])
-
-    def auth_start_sync(self) -> dict[str, Any]:
-        """Create or refresh a token exactly once. Never polls."""
-        if not self.enabled:
-            raise WebullReadOnlyError("NOT_CONFIGURED", "Webull keys are not configured")
-        local = self._load_local_token()
-        local_token = local.get("token") if local else None
-        response = self._api_call("create token", self.token_operation.create_token, local_token)
-        token_data = self._validate_token_payload(
-            self._response_json(response, "create token"),
-            "create token",
-        )
-        self._save_token(token_data)
-        return {"status": token_data["status"], "expires": token_data.get("expires")}
-
-    def auth_check_sync(self) -> dict[str, Any]:
-        """Check a token exactly once. Never polls."""
-        if not self.enabled:
-            raise WebullReadOnlyError("NOT_CONFIGURED", "Webull keys are not configured")
-        local = self._load_local_token()
-        if not local or not local.get("token"):
-            raise WebullReadOnlyError("NO_TOKEN", "No Webull token exists; run WEBULL AUTH")
-        response = self._api_call("check token", self.token_operation.check_token, local["token"])
-        token_data = self._validate_token_payload(
-            self._response_json(response, "check token"),
-            "check token",
-        )
-        self._save_token(token_data)
-        return {"status": token_data["status"], "expires": token_data.get("expires")}
-
-    def auth_state_sync(self) -> dict[str, Any]:
-        local = self._load_local_token()
-        if not local:
-            return {"status": "MISSING", "expires": None}
-        return {"status": local.get("status", "UNKNOWN"), "expires": local.get("expires")}
-
-    def _activate_saved_token(self) -> None:
-        local = self._load_local_token()
-        if not local or not local.get("token"):
-            raise WebullReadOnlyError("NO_TOKEN", "No Webull token exists; run WEBULL AUTH")
-        if local.get("status") != "NORMAL":
-            raise WebullReadOnlyError(
-                "TOKEN_NOT_READY",
-                f"Stored Webull token status is {local.get('status', 'UNKNOWN')}",
-            )
-        self.api_client.set_token(local["token"])
-
-    @staticmethod
-    def _find_account_ids(payload: Any) -> list[str]:
-        found: list[str] = []
-
-        def walk(value: Any) -> None:
-            if isinstance(value, dict):
-                for key, item in value.items():
-                    normalized = key.lower().replace("_", "")
-                    if normalized == "accountid" and item:
-                        found.append(str(item))
-                    else:
-                        walk(item)
-            elif isinstance(value, list):
-                for item in value:
-                    walk(item)
-
-        walk(payload)
-        return list(dict.fromkeys(found))
-
-    def account_snapshot_sync(self) -> dict[str, Any]:
-        if not self.enabled or self.account_v2 is None:
-            raise WebullReadOnlyError("NOT_CONFIGURED", "Webull keys are not configured")
-        self._activate_saved_token()
-
-        accounts_payload = self._response_json(
-            self._api_call("account list", self.account_v2.get_account_list),
-            "account list",
-        )
-        account_ids = self._find_account_ids(accounts_payload)
-        if not account_ids:
-            raise WebullReadOnlyError("NO_ACCOUNT", "Webull returned no account_id")
-
-        account_results: list[dict[str, Any]] = []
-        for account_id in account_ids:
-            self._wait_between_calls()
-            positions = self._response_json(
-                self._api_call(
-                    f"account positions …{account_id[-4:]}",
-                    self.account_v2.get_account_position,
-                    account_id,
-                ),
-                "account positions",
-            )
-            self._wait_between_calls()
-            balance = self._response_json(
-                self._api_call(
-                    f"account balance …{account_id[-4:]}",
-                    self.account_v2.get_account_balance,
-                    account_id,
-                ),
-                "account balance",
-            )
-            account_results.append(
-                {
-                    "account_id_masked": f"…{account_id[-4:]}",
-                    "positions": positions,
-                    "balance": balance,
-                }
-            )
-
-        return {
-            "source": "Webull OpenAPI",
-            "fetched_at_utc": utc_now(),
-            "accounts": account_results,
-        }
-
-    async def auth_start(self) -> dict[str, Any]:
-        return await asyncio.to_thread(self.auth_start_sync)
-
-    async def auth_check(self) -> dict[str, Any]:
-        return await asyncio.to_thread(self.auth_check_sync)
-
-    async def auth_state(self) -> dict[str, Any]:
-        return await asyncio.to_thread(self.auth_state_sync)
-
-    async def account_snapshot(self) -> dict[str, Any]:
-        return await asyncio.to_thread(self.account_snapshot_sync)
-
-
-try:
-    webull_reader = WebullReadOnly()
-except Exception as webull_init_error:
-    logger.exception("Webull initialization failed: %s", webull_init_error)
-    webull_reader = None
-
-# Exactly one explicit Webull operation at a time. No background polling.
-webull_operation_lock = asyncio.Lock()
-webull_last_request_monotonic = 0.0
-
-
-# ---------------------------------------------------------------------------
-# OpenAI analysis prompts
-# ---------------------------------------------------------------------------
-
-SCREENSHOT_ANALYSIS_PROMPT = r"""
-Ти — 🦁 SAFARI 1.4.3 SOURCE BRIDGE, read-only Trading Copilot.
-Ти НІКОЛИ не відкриваєш, не змінюєш і не закриваєш угоди. Лише читаєш,
-аналізуєш і даєш рекомендацію, остаточне рішення завжди за трейдером.
-
-ЗАВДАННЯ:
-1) Точно прочитай торговий скріншот.
-2) Визнач режим:
-   - GUARDIAN: відкрита позиція / P&L / quantity / average price.
-   - TRADING: нова ідея / option chain / вибір strike-expiration.
-   - UNKNOWN: даних недостатньо або це не торговий скріншот.
-3) Спочатку шукай причини ПРОТИ угоди або утримання позиції.
-4) Не вигадуй цифри, новини, OI, volume, earnings, flow, dark pool чи рівні.
-5) Число прив'язуй тільки до видимого підпису. Market Value не є strike.
-6) Позначай кожне ключове значення source = visible/calculated/missing.
-7) Для option contract перевіряй:
-   market_value ≈ premium × quantity × 100
-   total_cost ≈ entry × quantity × 100
-   pnl ≈ market_value - total_cost
-8) Якщо критичних даних немає, рішення WAIT, а не впевнене HOLD/BUY.
-9) Hard stop-фільтри:
-   wide_spread, low_liquidity, near_expiration, earnings_risk,
-   poor_risk_reward, conflicting_data. Для кожного status:
-   triggered / clear / not_checked.
-10) Поточну дату бери з окремого рядка «Сьогодні UTC». Обов’язково порахуй дні до експірації:
-    0–14 днів = near_expiration triggered; понад 14 = clear; якщо дату не розібрати = not_checked.
-11) Break Even опціону — це беззбитковість НА ЕКСПІРАЦІЮ, а не поточний стоп і не інвалідація.
-12) Якщо до експірації 14 днів або менше, не називай термін «тривалим» або «далеким»; Theta-ризик підвищений.
-13) Якщо інтерфейс упізнається як Webull (Open P&L, Day's P&L, Position Ratio, Sell to Close), platform = "Webull".
-14) Годинник у статус-барі телефона НЕ є timestamp ринкових даних. data_timestamp заповнюй лише тоді, коли дата/час явно показані всередині торгового застосунку.
-15) Числа безпосередньо під/біля Bid та Ask можуть бути Bid size / Ask size. НІКОЛИ не називай їх OI / Volume без окремих видимих підписів Open Interest/OI та Volume/Vol.
-16) Для open_interest і volume встановлюй label_visible=true лише коли відповідний підпис явно видно поруч із числом. Інакше value=null, source="missing", label_visible=false.
-17) Якщо актуальність скріншота не підтверджена повною датою всередині застосунку або підписом користувача «СВІЖИЙ/LIVE», не видавай поточне HOLD/REDUCE/EXIT: рішення WAIT, а дія — запросити свіжий скрін.
-
-ПОВЕРНИ ЛИШЕ ВАЛІДНИЙ JSON, без markdown, за схемою:
-{
-  "mode": "GUARDIAN|TRADING|UNKNOWN",
-  "platform": "string|null",
-  "data_quality": "high|medium|low",
-  "data_timestamp": "дата/час усередині торгового застосунку або null",
-  "data_freshness": "confirmed_current|user_confirmed|unconfirmed|stale",
-  "positions": [
-    {
-      "ticker": "string|null",
-      "instrument": "STOCK|CALL|PUT|UNKNOWN",
-      "strike": {"value": "number|string|null", "source": "visible|calculated|missing"},
-      "expiration": {"value": "string|null", "source": "visible|calculated|missing"},
-      "quantity": {"value": "number|string|null", "source": "visible|calculated|missing"},
-      "entry_price": {"value": "number|string|null", "source": "visible|calculated|missing"},
-      "total_cost": {"value": "number|string|null", "source": "visible|calculated|missing"},
-      "current_premium": {"value": "number|string|null", "source": "visible|calculated|missing"},
-      "market_value": {"value": "number|string|null", "source": "visible|calculated|missing"},
-      "pnl": {"value": "number|string|null", "source": "visible|calculated|missing"},
-      "pnl_percent": {"value": "number|string|null", "source": "visible|calculated|missing"},
-      "underlying_price": {"value": "number|string|null", "source": "visible|calculated|missing"},
-      "bid": {"value": "number|string|null", "source": "visible|calculated|missing"},
-      "ask": {"value": "number|string|null", "source": "visible|calculated|missing"},
-      "bid_size": {"value": "number|string|null", "source": "visible|calculated|missing"},
-      "ask_size": {"value": "number|string|null", "source": "visible|calculated|missing"},
-      "open_interest": {"value": "number|string|null", "source": "visible|calculated|missing", "label_visible": "boolean"},
-      "volume": {"value": "number|string|null", "source": "visible|calculated|missing", "label_visible": "boolean"},
-      "delta": {"value": "number|string|null", "source": "visible|calculated|missing"},
-      "gamma": {"value": "number|string|null", "source": "visible|calculated|missing"},
-      "theta": {"value": "number|string|null", "source": "visible|calculated|missing"},
-      "vega": {"value": "number|string|null", "source": "visible|calculated|missing"},
-      "iv": {"value": "number|string|null", "source": "visible|calculated|missing"},
-      "break_even": {"value": "number|string|null", "source": "visible|calculated|missing"},
-      "math_checks": {
-        "market_value": "consistent|inconsistent|insufficient",
-        "total_cost": "consistent|inconsistent|insufficient",
-        "pnl": "consistent|inconsistent|insufficient"
-      }
-    }
-  ],
-  "guardian": {
-    "decision": "HOLD|REDUCE|EXIT|WAIT|NOT_APPLICABLE",
-    "thesis_status": "intact|weakening|broken|unknown|not_applicable",
-    "strength": "strong|medium|weak|unknown",
-    "risk": "low|medium|high|unknown",
-    "invalidation": "string",
-    "target_1": "string",
-    "target_2": "string",
-    "max_risk": "string",
-    "one_action": "одна конкретна коротка дія зараз",
-    "why_short": "1-2 короткі речення",
-    "why_full": "детальне доказове пояснення; відділяй видимі факти від висновків"
-  },
-  "trading": {
-    "verdict": "PASS|TAKE|WAIT|NOT_APPLICABLE",
-    "strike": "string",
-    "expiration": "string",
-    "premium": "string",
-    "strength": "strong|medium|weak|unknown",
-    "risk": "low|medium|high|unknown",
-    "entry": "string",
-    "target_1": "string",
-    "target_2": "string",
-    "invalidation": "string",
-    "max_risk": "string",
-    "one_action": "одна конкретна коротка дія зараз",
-    "why_short": "1-2 короткі речення",
-    "why_full": "детальне доказове пояснення"
-  },
-  "hard_stops": [
-    {"name": "wide_spread", "status": "triggered|clear|not_checked", "evidence": "string"},
-    {"name": "low_liquidity", "status": "triggered|clear|not_checked", "evidence": "string"},
-    {"name": "near_expiration", "status": "triggered|clear|not_checked", "evidence": "string"},
-    {"name": "earnings_risk", "status": "triggered|clear|not_checked", "evidence": "string"},
-    {"name": "poor_risk_reward", "status": "triggered|clear|not_checked", "evidence": "string"},
-    {"name": "conflicting_data", "status": "triggered|clear|not_checked", "evidence": "string"}
-  ],
-  "missing_critical_data": ["string"],
-  "note": "string"
-}
-""".strip()
-
-WEBULL_SUMMARY_PROMPT = r"""
-Ти — 🦁 SAFARI GUARDIAN у режимі ТІЛЬКИ ЧИТАННЯ.
-Нижче передані сирі дані account positions/balance з Webull OpenAPI.
-
-ПРАВИЛА:
-1) Не показуй account IDs, внутрішні IDs або зайві службові поля.
-2) Не вигадуй новини, OI, flow, Greeks, цілі або рівні, яких немає в даних.
-3) Спочатку знайди ризики.
-4) Якщо немає графіка, тези або ринкового контексту — рішення WAIT.
-5) Відповідай українською.
-6) Не рекомендуй автоматичне виконання угод.
-7) ПОВЕРНИ ЛИШЕ ВАЛІДНИЙ JSON без markdown.
-
-СХЕМА:
-{
-  "summary": "готовий текст для Telegram: стислий аналіз усіх відкритих позицій, ризики, рішення і одна конкретна дія",
-  "data_quality": "high|medium|low",
-  "positions": [
-    {
-      "ticker": "string|null",
-      "instrument": "STOCK|CALL|PUT|UNKNOWN",
-      "strike": {"value": "number|string|null", "source": "api|calculated|missing"},
-      "expiration": {"value": "string|null", "source": "api|calculated|missing"},
-      "quantity": {"value": "number|string|null", "source": "api|calculated|missing"},
-      "entry_price": {"value": "number|string|null", "source": "api|calculated|missing"},
-      "total_cost": {"value": "number|string|null", "source": "api|calculated|missing"},
-      "current_premium": {"value": "number|string|null", "source": "api|calculated|missing"},
-      "market_value": {"value": "number|string|null", "source": "api|calculated|missing"},
-      "pnl": {"value": "number|string|null", "source": "api|calculated|missing"},
-      "pnl_percent": {"value": "number|string|null", "source": "api|calculated|missing"}
-    }
-  ],
-  "guardian": {
-    "decision": "HOLD|REDUCE|EXIT|WAIT",
-    "risk": "low|medium|high|unknown",
-    "why_full": "детальне доказове пояснення: окремо факти з API та обережні висновки"
-  }
-}
-
-Якщо відкритих позицій немає, positions має бути порожнім списком, а summary має це прямо сказати.
-""".strip()
-
-TEXT_CLOSE_PROMPT = r"""
-Витягни з повідомлення трейдера інформацію про завершену угоду.
-Поверни лише JSON:
-{
-  "ticker": "string|null",
-  "instrument": "STOCK|CALL|PUT|UNKNOWN",
-  "strike": "string|null",
-  "expiration": "string|null",
-  "result_amount": "number|null",
-  "result_percent": "number|null",
-  "lesson": "string",
-  "note": "string"
-}
-Не вигадуй відсутні цифри.
-""".strip()
-
-
-
-_MONTHS = {
-    "jan": 1, "january": 1,
-    "feb": 2, "february": 2,
-    "mar": 3, "march": 3,
-    "apr": 4, "april": 4,
-    "may": 5,
-    "jun": 6, "june": 6,
-    "jul": 7, "july": 7,
-    "aug": 8, "august": 8,
-    "sep": 9, "sept": 9, "september": 9,
-    "oct": 10, "october": 10,
-    "nov": 11, "november": 11,
-    "dec": 12, "december": 12,
-}
-
-
-def parse_expiration_date(value: Any) -> datetime | None:
-    """Parse common screenshot/API expiry formats without external dependencies."""
-    text = clean_text(value, "").strip()
-    if not text:
-        return None
-    text = re.sub(r"\([^)]*\)", "", text).strip()
-    iso = re.search(r"\b(20\d{2})-(\d{1,2})-(\d{1,2})\b", text)
-    if iso:
-        try:
-            return datetime(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)), tzinfo=timezone.utc)
-        except ValueError:
-            return None
-    m = re.search(r"\b(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{2,4})\b", text)
-    if not m:
-        return None
-    day = int(m.group(1))
-    month = _MONTHS.get(m.group(2).lower())
-    year = int(m.group(3))
-    if year < 100:
-        year += 2000
-    if not month:
-        return None
+def package_ver(name: str) -> str:
     try:
-        return datetime(year, month, day, tzinfo=timezone.utc)
-    except ValueError:
+        return package_version(name)
+    except PackageNotFoundError:
+        return "missing"
+
+
+def _message_content(update: Update) -> tuple[str | None, str | None, bool, bool]:
+    message = update.message
+    if not message:
+        return None, None, False, False
+    has_photo = bool(message.photo)
+    has_image_document = bool(
+        message.document
+        and clean_text(getattr(message.document, "mime_type", None), "").lower().startswith("image/")
+    )
+    return message.text, message.caption, has_photo, has_image_document
+
+
+def _pending_from_decision(mode: str | None, ticker: str | None, instrument: str | None) -> PendingIntent | None:
+    if mode not in {"TRADING", "GUARDIAN"}:
         return None
+    return make_pending_intent(mode, ticker, instrument or "UNKNOWN")  # type: ignore[arg-type]
 
 
-def _hard_stop(analysis: dict[str, Any], name: str) -> dict[str, Any]:
-    stops = analysis.setdefault("hard_stops", [])
-    if not isinstance(stops, list):
-        stops = []
-        analysis["hard_stops"] = stops
-    for item in stops:
-        if isinstance(item, dict) and clean_text(item.get("name"), "") == name:
-            return item
-    item = {"name": name, "status": "not_checked", "evidence": ""}
-    stops.append(item)
-    return item
-
-
-def parse_visible_data_date(value: Any) -> datetime | None:
-    """Parse a full date shown inside the trading app; time-only values are insufficient."""
-    text = clean_text(value, "").strip()
-    if not text:
-        return None
-
-    patterns = [
-        r"\b(20\d{2})-(\d{1,2})-(\d{1,2})\b",
-        r"\b(\d{1,2})/(\d{1,2})/(20\d{2})\b",
-        r"\b(\d{1,2})[.](\d{1,2})[.](20\d{2})\b",
-    ]
-    match = re.search(patterns[0], text)
-    if match:
-        year, month, day = map(int, match.groups())
-        try:
-            return datetime(year, month, day, tzinfo=timezone.utc)
-        except ValueError:
-            return None
-
-    match = re.search(patterns[1], text)
-    if match:
-        month, day, year = map(int, match.groups())
-        try:
-            return datetime(year, month, day, tzinfo=timezone.utc)
-        except ValueError:
-            return None
-
-    match = re.search(patterns[2], text)
-    if match:
-        day, month, year = map(int, match.groups())
-        try:
-            return datetime(year, month, day, tzinfo=timezone.utc)
-        except ValueError:
-            return None
-
-    month_first = re.search(
-        r"\b([A-Za-z]{3,9})\s+(\d{1,2})(?:,)?\s+(20\d{2})\b",
-        text,
-    )
-    if month_first:
-        month = _MONTHS.get(month_first.group(1).lower())
-        if month:
-            try:
-                return datetime(
-                    int(month_first.group(3)), month, int(month_first.group(2)), tzinfo=timezone.utc
-                )
-            except ValueError:
-                return None
-
-    day_first = re.search(
-        r"\b(\d{1,2})\s+([A-Za-z]{3,9})\s+(20\d{2})\b",
-        text,
-    )
-    if day_first:
-        month = _MONTHS.get(day_first.group(2).lower())
-        if month:
-            try:
-                return datetime(
-                    int(day_first.group(3)), month, int(day_first.group(1)), tzinfo=timezone.utc
-                )
-            except ValueError:
-                return None
-    return None
-
-
-def caption_confirms_freshness(caption: str) -> bool:
-    normalized = re.sub(r"\s+", " ", (caption or "").strip().lower())
-    return bool(
-        re.search(
-            r"(?:^|\b)(свіжий|свіжа|свіже|свежий|свежая|live|current|today|сьогодні)(?:\b|$)",
-            normalized,
-            flags=re.I,
-        )
-    )
-
-
-def _set_missing_field(position: dict[str, Any], name: str) -> None:
-    position[name] = {"value": None, "source": "missing", "label_visible": False}
-
-
-def enforce_data_guard(analysis: dict[str, Any], caption: str = "") -> dict[str, Any]:
-    """Block stale/unverified recommendations and prevent Bid/Ask size from becoming OI/Volume."""
-    positions = analysis.get("positions")
-    position = positions[0] if isinstance(positions, list) and positions and isinstance(positions[0], dict) else None
-
-    if position is not None:
-        for name in ("open_interest", "volume"):
-            field = position.get(name)
-            label_visible = isinstance(field, dict) and field.get("label_visible") is True
-            if not label_visible:
-                _set_missing_field(position, name)
-
-        oi = safe_float((position.get("open_interest") or {}).get("value"))
-        volume = safe_float((position.get("volume") or {}).get("value"))
-        liquidity = _hard_stop(analysis, "low_liquidity")
-        if oi is None or volume is None:
-            liquidity.update(
-                status="not_checked",
-                evidence="OI/Volume не підтверджені окремими видимими підписами; Bid/Ask size не замінює їх.",
-            )
-            missing = analysis.setdefault("missing_critical_data", [])
-            if not isinstance(missing, list):
-                missing = []
-                analysis["missing_critical_data"] = missing
-            for item in ("open_interest", "volume"):
-                if item not in missing:
-                    missing.append(item)
-
-    timestamp = clean_text(analysis.get("data_timestamp"), "")
-    visible_date = parse_visible_data_date(timestamp)
-    today = datetime.now(timezone.utc).date()
-
-    if visible_date is not None:
-        delta_days = (visible_date.date() - today).days
-        if delta_days == 0:
-            freshness = "confirmed_current"
-        elif delta_days < 0:
-            freshness = "stale"
-        else:
-            freshness = "unconfirmed"
-    elif caption_confirms_freshness(caption):
-        freshness = "user_confirmed"
+async def _download_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Path:
+    if not update.message:
+        raise RuntimeError("Message missing")
+    suffix = ".jpg"
+    if update.message.photo:
+        file_id = update.message.photo[-1].file_id
+    elif update.message.document and clean_text(update.message.document.mime_type, "").lower().startswith("image/"):
+        file_id = update.message.document.file_id
+        suffix = Path(update.message.document.file_name or "image.png").suffix or ".png"
     else:
-        freshness = "unconfirmed"
+        raise RuntimeError("No supported image attachment")
+    remote = await context.bot.get_file(file_id)
+    SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        delete=False,
+        dir=SCREENSHOT_DIR,
+        prefix=f"{update.effective_user.id if update.effective_user else 'unknown'}_",
+        suffix=suffix,
+    ) as temp_file:
+        path = Path(temp_file.name)
+    await remote.download_to_drive(custom_path=str(path))
+    return path
 
-    analysis["data_freshness"] = freshness
-    stale_stop = _hard_stop(analysis, "stale_data")
-    guardian = analysis.setdefault("guardian", {})
-    if not isinstance(guardian, dict):
-        guardian = {}
-        analysis["guardian"] = guardian
 
-    if freshness in {"confirmed_current", "user_confirmed"}:
-        stale_stop.update(status="clear", evidence="Актуальність підтверджена датою в застосунку або підписом СВІЖИЙ/LIVE.")
-    else:
-        evidence = (
-            f"На скріншоті дата {visible_date.date().isoformat()}, сьогодні {today.isoformat()}."
-            if freshness == "stale" and visible_date is not None
-            else "Повної дати ринкових даних не видно; час у статус-барі телефона не підтверджує актуальність."
-        )
-        stale_stop.update(status="triggered", evidence=evidence)
-        guardian["decision"] = "WAIT"
-        guardian["one_action"] = "Надішли свіжий скрін із підписом СВІЖИЙ; до цього торгове рішення не змінювати."
-        guardian["why_short"] = "Актуальність даних не підтверджена, тому SAFARI не видає поточне HOLD/REDUCE/EXIT."
-        existing_why = clean_text(guardian.get("why_full"), "")
-        guard_text = (
-            "DATA GUARD: актуальність скріншота не підтверджена. "
-            "Час у статус-барі телефона не є timestamp ринкових даних. "
-            "Торгове рішення за цими даними не видається."
-        )
-        guardian["why_full"] = (guard_text + (" " + existing_why if existing_why else "")).strip()
-        analysis["data_quality"] = "low" if freshness == "stale" else "medium"
+def _increment_pending_attempt(user_id: int, pending: PendingIntent | None) -> None:
+    if not pending:
+        return
+    updated = PendingIntent(
+        mode=pending.mode,
+        ticker=pending.ticker,
+        instrument=pending.instrument,
+        created_at_utc=pending.created_at_utc,
+        expires_at_utc=pending.expires_at_utc,
+        attempts=pending.attempts + 1,
+    )
+    state_store.set_pending(user_id, updated)
 
-    note = clean_text(analysis.get("note"), "")
-    data_note = "DATA GUARD: freshness and OI/Volume labels checked deterministically."
-    analysis["note"] = (note + " " + data_note).strip()
+
+def _force_webull_sources(analysis: dict[str, Any]) -> dict[str, Any]:
+    for position in analysis.get("positions", []):
+        if not isinstance(position, dict):
+            continue
+        for key, value in position.items():
+            if isinstance(value, dict) and "source" in value:
+                value["source"] = "api" if value.get("value") not in (None, "") else "missing"
+                value["scope"] = "position"
+                value["label_visible"] = value.get("value") not in (None, "")
     return analysis
 
 
-def enforce_core_guardrails(analysis: dict[str, Any], caption: str = "") -> dict[str, Any]:
-    """Deterministic corrections for expiry, theta, break-even, freshness and labels."""
-    positions = analysis.get("positions")
-    if not isinstance(positions, list) or not positions:
-        return analysis
-    position = positions[0] if isinstance(positions[0], dict) else {}
-    expiration_value = (position.get("expiration") or {}).get("value")
-    expiry = parse_expiration_date(expiration_value)
-    today = datetime.now(timezone.utc).date()
-    days: int | None = (expiry.date() - today).days if expiry else None
-    analysis["days_to_expiration"] = days
-
-    near = _hard_stop(analysis, "near_expiration")
-    if days is None:
-        near.update(status="not_checked", evidence="Дату експірації не вдалося надійно розібрати.")
-    elif days < 0:
-        near.update(status="triggered", evidence=f"Експірація минула {-days} дн. тому; дані можуть бути застарілими.")
-    elif days <= 14:
-        near.update(status="triggered", evidence=f"До експірації {days} дн.; часовий розпад прискорюється.")
-    else:
-        near.update(status="clear", evidence=f"До експірації {days} дн.")
-
-    guardian = analysis.setdefault("guardian", {})
-    if not isinstance(guardian, dict):
-        guardian = {}
-        analysis["guardian"] = guardian
-
-    break_even = safe_float((position.get("break_even") or {}).get("value"))
-    theta = safe_float((position.get("theta") or {}).get("value"))
-    quantity = safe_float((position.get("quantity") or {}).get("value"))
-    market_value = safe_float((position.get("market_value") or {}).get("value"))
-    theta_daily = abs(theta) * quantity * 100 if theta is not None and quantity is not None else None
-    theta_pct = (theta_daily / market_value * 100) if theta_daily is not None and market_value else None
-
-    if days is not None and days <= 14:
-        guardian["risk"] = "high"
-        if clean_text(guardian.get("thesis_status"), "unknown") not in {"broken"}:
-            guardian["thesis_status"] = "weakening"
-        guardian["one_action"] = (
-            "Не збільшувати позицію; спочатку визначити технічний рівень інвалідації по графіку SOFI."
-        )
-        guardian["why_short"] = (
-            f"До експірації лише {days} дн., тому Theta-ризик підвищений. "
-            "Break-even на експірацію не є поточним стоп-рівнем."
-        )
-
-    if break_even is not None:
-        guardian["invalidation"] = (
-            f"Не визначено: ${break_even:.2f} — break-even на експірацію, а не поточний стоп. "
-            "Потрібен технічний рівень по графіку або чітка торгова теза."
-        )
-
-    details = []
-    if days is not None:
-        details.append(f"Факт: до експірації {days} дн.")
-    if theta_daily is not None:
-        theta_text = f"приблизно ${theta_daily:.2f}/день для {int(quantity or 0)} контрактів"
-        if theta_pct is not None:
-            theta_text += f" (~{theta_pct:.1f}% поточної вартості позиції за день за незмінних інших умов)"
-        details.append("Оцінка Theta: " + theta_text + "; Theta змінюється з ринком.")
-    if break_even is not None:
-        details.append(f"${break_even:.2f} — беззбитковість на дату експірації, не інвалідація сьогодні.")
-
-    why = clean_text(guardian.get("why_full"), "")
-    why = re.sub(r"тривал(ий|ого|ому|им)?\s+термін\s+експірації", "короткий термін до експірації", why, flags=re.I)
-    if days is not None and days <= 14:
-        why = re.sub(r"ризик(и)?\s+середн(і|ій|ього|ьому|ім)", "ризик підвищений", why, flags=re.I)
-    why = re.sub(r"експіраці(я|ї)\s+[^.]{0,40}(далек|distant)[^.]*\.?", "", why, flags=re.I)
-    guardian["why_full"] = " ".join(details + ([why] if why else [])).strip()
-
-    note = clean_text(analysis.get("note"), "")
-    deterministic_note = (
-        "CORE FIX: строк до експірації та значення break-even перевірені кодом, а не лише мовною моделлю."
-    )
-    analysis["note"] = (note + " " + deterministic_note).strip()
-    return enforce_data_guard(analysis, caption=caption)
-
-
-async def analyze_screenshot(image_path: Path, caption: str = "") -> dict[str, Any]:
-    image_base64 = encode_image(image_path)
-    response = await openai_client.responses.create(
-        model=OPENAI_MODEL,
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": SCREENSHOT_ANALYSIS_PROMPT},
-                    {
-                        "type": "input_text",
-                        "text": f"Сьогодні UTC: {datetime.now(timezone.utc).date().isoformat()}",
-                    },
-                    {
-                        "type": "input_text",
-                        "text": f"Підпис користувача: {caption or 'немає'}",
-                    },
-                    {
-                        "type": "input_image",
-                        "image_url": f"data:image/jpeg;base64,{image_base64}",
-                    },
-                ],
-            }
-        ],
-        max_output_tokens=2400,
-    )
-    analysis = extract_json_object(response.output_text)
-    return enforce_core_guardrails(analysis, caption=caption)
-
-
-async def summarize_webull(snapshot: dict[str, Any]) -> dict[str, Any]:
-    response = await openai_client.responses.create(
-        model=OPENAI_MODEL,
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": WEBULL_SUMMARY_PROMPT},
-                    {
-                        "type": "input_text",
-                        "text": json.dumps(snapshot, ensure_ascii=False),
-                    },
-                ],
-            }
-        ],
-        max_output_tokens=2400,
-    )
-    result = extract_json_object(response.output_text)
-    if not isinstance(result.get("positions"), list):
-        raise RuntimeError("Webull analysis contains no positions list")
-    if not clean_text(result.get("summary"), ""):
-        raise RuntimeError("Webull analysis contains no summary")
-    return result
-
-
-async def parse_closed_trade(text: str) -> dict[str, Any]:
-    response = await openai_client.responses.create(
-        model=OPENAI_MODEL,
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": TEXT_CLOSE_PROMPT},
-                    {"type": "input_text", "text": text},
-                ],
-            }
-        ],
-        max_output_tokens=600,
-    )
-    return extract_json_object(response.output_text)
-
-
 # ---------------------------------------------------------------------------
-# Formatting and state updates
-# ---------------------------------------------------------------------------
-
-
-def value_with_source(field: Any, formatter: str = "text") -> str:
-    if not isinstance(field, dict):
-        return clean_text(field)
-    value = field.get("value")
-    source = clean_text(field.get("source"), "missing")
-    if formatter == "money":
-        rendered = money(value)
-    elif formatter == "percent":
-        rendered = percentage(value)
-    else:
-        rendered = clean_text(value)
-    source_labels = {
-        "visible": "видно",
-        "api": "Webull",
-        "calculated": "розраховано",
-        "missing": "не видно",
-    }
-    label = source_labels.get(source, source)
-    if rendered == "не видно":
-        return rendered
-    return f"{rendered} ({label})"
-
-
-def _canonical_instrument(value: Any) -> str:
-    text = clean_text(value, "UNKNOWN").upper()
-    if "CALL" in text:
-        return "CALL"
-    if "PUT" in text:
-        return "PUT"
-    if "STOCK" in text or "SHARE" in text:
-        return "STOCK"
-    return text
-
-
-def _canonical_strike(value: Any) -> str:
-    number = safe_float(value)
-    if number is None:
-        return "-"
-    return f"{number:.4f}".rstrip("0").rstrip(".")
-
-
-def _canonical_expiration(value: Any) -> str:
-    parsed = parse_expiration_date(value)
-    if parsed is not None:
-        return parsed.date().isoformat()
-    raw = clean_text(value, "-").upper()
-    raw = re.sub(r"\([^)]*\)", "", raw)
-    return re.sub(r"\s+", " ", raw).strip() or "-"
-
-
-def position_key(position: dict[str, Any]) -> str:
-    """Stable identity for one position across API and screenshot formats."""
-    ticker = clean_text(position.get("ticker"), "UNKNOWN").upper()
-    instrument = _canonical_instrument(position.get("instrument"))
-    strike = _canonical_strike((position.get("strike") or {}).get("value"))
-    expiration = _canonical_expiration((position.get("expiration") or {}).get("value"))
-    return f"{ticker}|{instrument}|{strike}|{expiration}"
-
-
-def _matching_position_keys(
-    position_store: dict[str, Any],
-    position: dict[str, Any],
-) -> list[str]:
-    target = position_key(position)
-    matches: list[str] = []
-    for stored_key, item in position_store.items():
-        if not isinstance(item, dict):
-            continue
-        stored_position = item.get("position")
-        if isinstance(stored_position, dict) and position_key(stored_position) == target:
-            matches.append(stored_key)
-    return matches
-
-
-def _field_is_present(field: Any) -> bool:
-    if not isinstance(field, dict):
-        return field not in (None, "")
-    source = clean_text(field.get("source"), "missing").lower()
-    value = field.get("value")
-    return source != "missing" and value not in (None, "")
-
-
-def _merge_position_fields(
-    existing: dict[str, Any],
-    fresh: dict[str, Any],
-    *,
-    preserve_webull_identity: bool = False,
-) -> dict[str, Any]:
-    """Overlay fresh market fields while preserving Webull position identity."""
-    merged = deepcopy(existing)
-    for name, value in fresh.items():
-        if name in {"ticker", "instrument"}:
-            if clean_text(value, ""):
-                merged[name] = value
-            continue
-        if name == "math_checks":
-            if isinstance(value, dict):
-                merged[name] = deepcopy(value)
-            continue
-        if (
-            preserve_webull_identity
-            and name in WEBULL_IDENTITY_FIELDS
-            and _field_is_present(merged.get(name))
-        ):
-            continue
-        if _field_is_present(value):
-            merged[name] = deepcopy(value)
-        elif name not in merged:
-            merged[name] = deepcopy(value)
-
-    if preserve_webull_identity:
-        for field_name in WEBULL_IDENTITY_FIELDS:
-            field = merged.get(field_name)
-            if isinstance(field, dict) and field.get("value") not in (None, ""):
-                field["source"] = "api"
-    return merged
-
-
-def _preferred_existing_item(
-    position_store: dict[str, Any],
-    matching_keys: list[str],
-) -> dict[str, Any] | None:
-    candidates = [position_store.get(key) for key in matching_keys]
-    valid = [item for item in candidates if isinstance(item, dict)]
-    for item in valid:
-        if item.get("source") == "Webull OpenAPI":
-            return item
-    if not valid:
-        return None
-    return max(valid, key=lambda item: clean_text(item.get("updated_at_utc"), ""))
-
-
-def update_state_from_analysis(user_id: int, analysis: dict[str, Any]) -> None:
-    user = state_store.user(user_id)
-    user["last_analysis"] = analysis
-
-    mode = clean_text(analysis.get("mode"), "UNKNOWN").upper()
-    detail = analysis.get("guardian") if mode == "GUARDIAN" else analysis.get("trading")
-    if isinstance(detail, dict):
-        user["last_full_reason"] = clean_text(detail.get("why_full"), "")
-
-    if mode == "GUARDIAN" and clean_text(analysis.get("data_freshness"), "unconfirmed") in {
-        "confirmed_current",
-        "user_confirmed",
-    }:
-        positions = analysis.get("positions")
-        if isinstance(positions, list):
-            position_store = user.setdefault("positions", {})
-            if not isinstance(position_store, dict):
-                position_store = {}
-                user["positions"] = position_store
-            for position in positions:
-                if not isinstance(position, dict):
-                    continue
-
-                canonical_key = position_key(position)
-                matching_keys = _matching_position_keys(position_store, position)
-                preferred = _preferred_existing_item(position_store, matching_keys)
-
-                if preferred is not None:
-                    existing_position = preferred.get("position", {})
-                    preferred_is_webull = preferred.get("source") == "Webull OpenAPI"
-                    merged_position = _merge_position_fields(
-                        existing_position if isinstance(existing_position, dict) else {},
-                        position,
-                        preserve_webull_identity=preferred_is_webull,
-                    )
-                    source = (
-                        "Webull OpenAPI"
-                        if preferred.get("source") == "Webull OpenAPI"
-                        else "screenshot"
-                    )
-                else:
-                    merged_position = deepcopy(position)
-                    source = "screenshot"
-
-                # Collapse every legacy/API/screenshot key for the same contract.
-                for old_key in matching_keys:
-                    position_store.pop(old_key, None)
-
-                position_store[canonical_key] = {
-                    "position": merged_position,
-                    "guardian": analysis.get("guardian", {}),
-                    "hard_stops": analysis.get("hard_stops", []),
-                    "data_quality": analysis.get("data_quality", "low"),
-                    "updated_at_utc": utc_now(),
-                    "source": source,
-                    "market_data_source": "fresh screenshot",
-                }
-                logger.info(
-                    "GUARDIAN_MEMORY merge key=%s collapsed=%s source=%s user=%s",
-                    canonical_key,
-                    len(matching_keys),
-                    source,
-                    user_id,
-                )
-
-    state_store.update_user(user_id, user)
-
-
-def update_state_from_webull(
-    user_id: int,
-    analysis: dict[str, Any],
-    fetched_at_utc: Any,
-) -> None:
-    """Persist the latest live Webull positions into GUARDIAN memory.
-
-    Webull-sourced entries are replaced on each successful read so closed
-    positions do not remain stale. Screenshot-sourced entries are preserved.
-    """
-    user = state_store.user(user_id)
-    user["last_analysis"] = {
-        "mode": "GUARDIAN",
-        "platform": "Webull OpenAPI",
-        "data_quality": analysis.get("data_quality", "low"),
-        "positions": analysis.get("positions", []),
-        "guardian": analysis.get("guardian", {}),
-        "data_timestamp": clean_text(fetched_at_utc, utc_now()),
-    }
-
-    guardian = analysis.get("guardian")
-    if isinstance(guardian, dict):
-        user["last_full_reason"] = clean_text(guardian.get("why_full"), "")
-
-    position_store = user.setdefault("positions", {})
-    if not isinstance(position_store, dict):
-        position_store = {}
-        user["positions"] = position_store
-
-    stale_webull_keys = [
-        key
-        for key, item in position_store.items()
-        if isinstance(item, dict) and item.get("source") == "Webull OpenAPI"
-    ]
-    for key in stale_webull_keys:
-        position_store.pop(key, None)
-
-    positions = analysis.get("positions", [])
-    if isinstance(positions, list):
-        for position in positions:
-            if not isinstance(position, dict):
-                continue
-            key = position_key(position)
-
-            # A live API read is authoritative for position existence. Remove any
-            # screenshot/legacy copies of the same contract before saving it.
-            matching_keys = _matching_position_keys(position_store, position)
-            for old_key in matching_keys:
-                position_store.pop(old_key, None)
-
-            position_store[key] = {
-                "position": position,
-                "guardian": analysis.get("guardian", {}),
-                "hard_stops": [],
-                "data_quality": analysis.get("data_quality", "low"),
-                "updated_at_utc": clean_text(fetched_at_utc, utc_now()),
-                "source": "Webull OpenAPI",
-                "market_data_source": "Webull OpenAPI",
-            }
-
-    state_store.update_user(user_id, user)
-    logger.info(
-        "GUARDIAN_MEMORY saved source=Webull positions=%s user=%s",
-        len(positions) if isinstance(positions, list) else 0,
-        user_id,
-    )
-
-
-def hard_stop_lines(analysis: dict[str, Any]) -> list[str]:
-    labels = {
-        "wide_spread": "широкий spread",
-        "low_liquidity": "низька ліквідність",
-        "near_expiration": "близька експірація",
-        "earnings_risk": "ризик earnings",
-        "poor_risk_reward": "поганий risk/reward",
-        "conflicting_data": "суперечливі дані",
-        "stale_data": "актуальність даних",
-    }
-    icons = {"triggered": "🛑", "clear": "✅", "not_checked": "⚪"}
-    lines: list[str] = []
-    for item in analysis.get("hard_stops", []):
-        if not isinstance(item, dict):
-            continue
-        name = clean_text(item.get("name"))
-        status = clean_text(item.get("status"), "not_checked")
-        evidence = clean_text(item.get("evidence"), "не перевірено")
-        lines.append(
-            f"{icons.get(status, '⚪')} {labels.get(name, name)}: {evidence}"
-        )
-    return lines
-
-
-def format_analysis(analysis: dict[str, Any]) -> str:
-    mode = clean_text(analysis.get("mode"), "UNKNOWN").upper()
-    platform = clean_text(analysis.get("platform"))
-    quality = clean_text(analysis.get("data_quality"), "low")
-    timestamp = clean_text(analysis.get("data_timestamp"), "не видно")
-    positions = analysis.get("positions") if isinstance(analysis.get("positions"), list) else []
-
-    title = {
-        "GUARDIAN": "🛡 SAFARI GUARDIAN",
-        "TRADING": "🎯 SAFARI TRADING",
-        "UNKNOWN": "🦁 SAFARI VISION",
-    }.get(mode, "🦁 SAFARI")
-
-    freshness = clean_text(analysis.get("data_freshness"), "unconfirmed")
-    freshness_labels = {
-        "confirmed_current": "підтверджена",
-        "user_confirmed": "підтверджена користувачем",
-        "unconfirmed": "НЕ ПІДТВЕРДЖЕНА",
-        "stale": "ЗАСТАРІЛА",
-    }
-    lines = [
-        title,
-        "",
-        f"📱 Платформа: {platform}",
-        f"🕒 Дані: {timestamp}",
-        f"🧭 Актуальність: {freshness_labels.get(freshness, freshness)}",
-    ]
-
-    for index, position in enumerate(positions, start=1):
-        if not isinstance(position, dict):
-            continue
-        if len(positions) > 1:
-            lines.extend(["", f"Позиція #{index}"])
-        lines.extend(
-            [
-                f"📈 Тикер: {clean_text(position.get('ticker'))}",
-                f"📌 Інструмент: {clean_text(position.get('instrument'))}",
-                f"🎯 Страйк: {value_with_source(position.get('strike'), 'money')}",
-                f"📅 Експірація: {value_with_source(position.get('expiration'))}",
-                (
-                    f"⏳ До експірації: {analysis.get('days_to_expiration')} дн."
-                    if analysis.get("days_to_expiration") is not None
-                    else "⏳ До експірації: не визначено"
-                ),
-                f"📦 Кількість: {value_with_source(position.get('quantity'))}",
-                f"💰 Вхід: {value_with_source(position.get('entry_price'), 'money')}",
-                f"💳 Total Cost: {value_with_source(position.get('total_cost'), 'money')}",
-                f"💵 Премія: {value_with_source(position.get('current_premium'), 'money')}",
-                f"🧾 Market Value: {value_with_source(position.get('market_value'), 'money')}",
-                f"📊 P/L: {value_with_source(position.get('pnl'), 'money')}",
-                f"📉 P/L %: {value_with_source(position.get('pnl_percent'), 'percent')}",
-                f"🏷️ Акція: {value_with_source(position.get('underlying_price'), 'money')}",
-                f"↔️ Bid / Ask: {value_with_source(position.get('bid'), 'money')} / "
-                f"{value_with_source(position.get('ask'), 'money')}",
-                f"📦 Bid size / Ask size: {value_with_source(position.get('bid_size'))} / "
-                f"{value_with_source(position.get('ask_size'))}",
-                f"📚 OI / Volume: {value_with_source(position.get('open_interest'))} / "
-                f"{value_with_source(position.get('volume'))}",
-                f"⚙️ Delta / Theta: {value_with_source(position.get('delta'))} / "
-                f"{value_with_source(position.get('theta'))}",
-                f"🌡️ IV: {value_with_source(position.get('iv'), 'percent')}",
-                f"🎯 Break Even: {value_with_source(position.get('break_even'), 'money')}",
-            ]
-        )
-
-        checks = position.get("math_checks")
-        if isinstance(checks, dict):
-            lines.extend(
-                [
-                    "",
-                    "🧮 Перевірка:",
-                    f"• Market Value: {clean_text(checks.get('market_value'))}",
-                    f"• Total Cost: {clean_text(checks.get('total_cost'))}",
-                    f"• P/L: {clean_text(checks.get('pnl'))}",
-                ]
-            )
-
-    lines.extend(["", "🛑 Стоп-фільтри:"])
-    stop_lines = hard_stop_lines(analysis)
-    lines.extend(stop_lines or ["⚪ Не перевірено"])
-
-    missing = analysis.get("missing_critical_data")
-    if isinstance(missing, list) and missing:
-        lines.extend(["", "❓ Не вистачає: " + "; ".join(map(str, missing[:8]))])
-
-    if mode == "GUARDIAN":
-        guardian = analysis.get("guardian") if isinstance(analysis.get("guardian"), dict) else {}
-        lines.extend(
-            [
-                "",
-                f"🛡 Рішення: {clean_text(guardian.get('decision'), 'WAIT')}",
-                f"🧭 Сценарій: {clean_text(guardian.get('thesis_status'), 'unknown')}",
-                f"💪 Сила: {clean_text(guardian.get('strength'), 'unknown')}",
-                f"⚠️ Ризик: {clean_text(guardian.get('risk'), 'unknown')}",
-                f"⛔ Інвалідація: {clean_text(guardian.get('invalidation'))}",
-                f"🎯 Ціль 1: {clean_text(guardian.get('target_1'))}",
-                f"🎯 Ціль 2: {clean_text(guardian.get('target_2'))}",
-                f"💵 Максимальний ризик: {clean_text(guardian.get('max_risk'))}",
-                "",
-                f"👉 Дія: {clean_text(guardian.get('one_action'), 'WAIT')}",
-                f"Коротко: {clean_text(guardian.get('why_short'))}",
-            ]
-        )
-    elif mode == "TRADING":
-        trading = analysis.get("trading") if isinstance(analysis.get("trading"), dict) else {}
-        verdict = clean_text(trading.get("verdict"), "WAIT")
-        lines.extend(
-            [
-                "",
-                f"Вердикт: {'✅' if verdict == 'TAKE' else '❌' if verdict == 'PASS' else '⏸'} {verdict}",
-                f"🎯 Страйк: {clean_text(trading.get('strike'))}",
-                f"📅 Експірація: {clean_text(trading.get('expiration'))}",
-                f"💰 Премія: {clean_text(trading.get('premium'))}",
-                f"💪 Сила: {clean_text(trading.get('strength'), 'unknown')}",
-                f"⚠️ Ризик: {clean_text(trading.get('risk'), 'unknown')}",
-                f"📍 Вхід: {clean_text(trading.get('entry'))}",
-                f"🎯 Ціль 1: {clean_text(trading.get('target_1'))}",
-                f"🎯 Ціль 2: {clean_text(trading.get('target_2'))}",
-                f"⛔ Інвалідація: {clean_text(trading.get('invalidation'))}",
-                f"💵 Максимальний ризик: {clean_text(trading.get('max_risk'))}",
-                "",
-                f"👉 Дія: {clean_text(trading.get('one_action'), 'WAIT')}",
-                f"Коротко: {clean_text(trading.get('why_short'))}",
-            ]
-        )
-    else:
-        lines.extend(
-            [
-                "",
-                "⏸ Рішення: WAIT",
-                f"👉 Дія: {clean_text(analysis.get('note'), 'Надішли чіткіший торговий скріншот.')}",
-            ]
-        )
-
-    lines.extend(["", f"🔎 Якість даних: {quality}", "Напиши «Чому?» для повного аналізу."])
-    return "\n".join(lines)
-
-
-def remove_screenshot_position_duplicates(user_id: int) -> tuple[int, int]:
-    """Remove only legacy screenshot-sourced GUARDIAN entries.
-
-    Live Webull OpenAPI positions are never removed by this cleanup.
-    Returns (removed_screenshot_entries, preserved_webull_entries).
-    """
-    user = state_store.user(user_id)
-    positions = user.get("positions", {})
-    if not isinstance(positions, dict):
-        return 0, 0
-
-    screenshot_keys = [
-        key
-        for key, item in positions.items()
-        if isinstance(item, dict) and item.get("source") == "screenshot"
-    ]
-    preserved_webull = sum(
-        1
-        for item in positions.values()
-        if isinstance(item, dict) and item.get("source") == "Webull OpenAPI"
-    )
-
-    for key in screenshot_keys:
-        positions.pop(key, None)
-
-    if screenshot_keys:
-        user["positions"] = positions
-        state_store.update_user(user_id, user)
-        logger.info(
-            "GUARDIAN_MEMORY cleanup removed_screenshot=%s preserved_webull=%s user=%s",
-            len(screenshot_keys),
-            preserved_webull,
-            user_id,
-        )
-
-    return len(screenshot_keys), preserved_webull
-
-
-def format_local_positions(user_id: int) -> str:
-    user = state_store.user(user_id)
-    positions = user.get("positions", {})
-    if not isinstance(positions, dict) or not positions:
-        return (
-            "🛡 SAFARI GUARDIAN\n\n"
-            "Локально збережених позицій ще немає.\n"
-            "Надішли скріншот відкритої позиції або напиши WEBULL."
-        )
-
-    lines = ["🛡 SAFARI — ЗБЕРЕЖЕНІ ПОЗИЦІЇ"]
-    for item in positions.values():
-        if not isinstance(item, dict):
-            continue
-        position = item.get("position", {})
-        guardian = item.get("guardian", {})
-        lines.extend(
-            [
-                "",
-                f"📈 {clean_text(position.get('ticker'))} "
-                f"{clean_text(position.get('instrument'))} "
-                f"{value_with_source(position.get('strike'), 'money')}",
-                f"📅 {value_with_source(position.get('expiration'))}",
-                f"📦 {value_with_source(position.get('quantity'))}",
-                f"📊 P/L: {value_with_source(position.get('pnl'), 'money')} "
-                f"({value_with_source(position.get('pnl_percent'), 'percent')})",
-                f"🛡 {clean_text(guardian.get('decision'), 'WAIT')} | "
-                f"ризик {clean_text(guardian.get('risk'), 'unknown')}",
-                f"🔗 Позиція: {'Webull' if item.get('source') == 'Webull OpenAPI' else 'скрін'} | "
-                f"ринок: {'свіжий скрін' if item.get('market_data_source') == 'fresh screenshot' else 'Webull'}",
-                f"🕒 {clean_text(item.get('updated_at_utc'))}",
-            ]
-        )
-    lines.extend(["", "Для живих даних напиши: WEBULL"])
-    return "\n".join(lines)
-
-
-def format_dossier(user_id: int) -> str:
-    user = state_store.user(user_id)
-    dossier = user.get("dossier", [])
-    if not isinstance(dossier, list) or not dossier:
-        return "📚 SAFARI DOSSIER\n\nЗавершених угод ще не записано."
-
-    lines = ["📚 SAFARI DOSSIER"]
-    for entry in dossier[-10:]:
-        if not isinstance(entry, dict):
-            continue
-        amount = money(entry.get("result_amount"), "не вказано")
-        pct = percentage(entry.get("result_percent"), "не вказано")
-        lines.extend(
-            [
-                "",
-                f"📈 {clean_text(entry.get('ticker'))} {clean_text(entry.get('instrument'))}",
-                f"📊 Результат: {amount} / {pct}",
-                f"🧠 Урок: {clean_text(entry.get('lesson'), 'не записано')}",
-                f"📝 {clean_text(entry.get('note'), '')}",
-                f"🕒 {clean_text(entry.get('closed_at_utc'))}",
-            ]
-        )
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Telegram handlers
+# Basic commands
 # ---------------------------------------------------------------------------
 
 
@@ -1650,436 +193,395 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     del context
     if not update.message:
         return
-    storage_line = (
-        "💾 Пам’ять: постійна ✅"
-        if PERSISTENT_STORAGE
-        else "⚠️ Пам’ять: тимчасова — потрібен Railway Volume"
+    storage = "постійна ✅" if PERSISTENT_STORAGE else "тимчасова — потрібен Railway Volume"
+    await update.message.reply_text(
+        f"🦁 SAFARI {SAFARI_VERSION} на зв’язку.\n\n"
+        "Тільки читання, аналіз і рекомендації. Автоматичних угод немає.\n\n"
+        "Основний цикл:\n"
+        "• ТРЕЙДИНГ TSLA CALL — задати ідею\n"
+        "• наступний скрін — перевірка саме цієї ідеї\n"
+        "• WEBULL — синхронізувати відкриті позиції\n"
+        "• МОЇ ПОЗИЦІЇ — локальна пам’ять\n"
+        "• ЧОМУ? — докази рішення\n"
+        "• ДОСЬЄ — завершені угоди\n"
+        "• СКАСУВАТИ — прибрати очікуваний скрін\n"
+        "• СТАТУС — версія й стан\n\n"
+        f"💾 Пам’ять: {storage}"
+    )
+
+
+async def status_command(update: Update) -> None:
+    if not update.message or not update.effective_user:
+        return
+    pending = state_store.pending(update.effective_user.id)
+    pending_line = (
+        f"очікується скрін {pending.mode} {pending.ticker or ''} {pending.instrument}".strip()
+        if pending
+        else "немає очікуваного скріну"
     )
     await update.message.reply_text(
-        "🦁 SAFARI 1.4.3 SOURCE BRIDGE на зв’язку.\n\n"
-        "Тільки читання, аналіз і рекомендації. Автоматичних угод немає.\n\n"
-        "Команди:\n"
-        "• надішли скріншот — VISION + TRADING/GUARDIAN\n"
-        "• WEBULL AUTH — створити один запит 2FA\n"
-        "• WEBULL CHECK — одна перевірка підтвердження\n"
-        "• WEBULL — живі позиції після авторизації (з паузами між API-викликами)\n"
-        "• МОЇ ПОЗИЦІЇ — локальна пам’ять\n"
-        "• ОЧИСТИТИ ДУБЛІ — видалити лише старі screenshot-записи\n"
-        "• ЧОМУ? — повне пояснення\n"
-        "• ДОСЬЄ — журнал завершених угод\n"
-        "• ЗАКРИВ SOFI ... — записати завершену угоду\n\n"
-        + storage_line
+        f"🦁 SAFARI STATUS\n\n"
+        f"Версія: {SAFARI_VERSION}\n"
+        f"Режим: READ ONLY ✅\n"
+        f"Router: deterministic ✅\n"
+        f"State: {pending_line}\n"
+        f"OpenAI model: {OPENAI_MODEL}\n"
+        f"Webull: {'configured' if webull_reader and webull_reader.enabled else 'not configured'}"
     )
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await start(update, context)
-
-
-async def positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context
+async def why_message(update: Update) -> None:
     if not update.message or not update.effective_user:
         return
-    await send_long_message(
-        update.message,
-        format_local_positions(update.effective_user.id),
-    )
-
-
-async def dossier_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context
-    if not update.message or not update.effective_user:
+    reason = clean_text(state_store.user(update.effective_user.id).get("last_full_reason"), "")
+    if not reason:
+        await update.message.reply_text("🦁 SAFARI\n\nСпочатку надішли торговий скрін або виконай WEBULL.")
         return
-    await send_long_message(update.message, format_dossier(update.effective_user.id))
+    await send_long_message(update.message, "🔍 ЧОМУ?\n\n" + reason)
+
+
+# ---------------------------------------------------------------------------
+# Webull handlers
+# ---------------------------------------------------------------------------
 
 
 def _webull_ready() -> bool:
-    return bool(webull_reader is not None and getattr(webull_reader, "enabled", False))
+    return bool(webull_reader is not None and webull_reader.enabled)
 
 
 async def _webull_guard(message: Any) -> bool:
-    """Local anti-spam guard only; it never calls Webull."""
     global webull_last_request_monotonic
     if webull_operation_lock.locked():
-        await message.reply_text(
-            "🦁 SAFARI WEBULL\n\n⏳ Інша Webull-операція ще виконується. Не повторюй команду."
-        )
+        await message.reply_text("🦁 SAFARI WEBULL\n\n⏳ Інша Webull-операція ще виконується. Не повторюй команду.")
         return False
     now = time.monotonic()
     elapsed = now - webull_last_request_monotonic
     if webull_last_request_monotonic and elapsed < WEBULL_LOCAL_COOLDOWN_SECONDS:
         seconds = int(WEBULL_LOCAL_COOLDOWN_SECONDS - elapsed) + 1
-        await message.reply_text(
-            f"🦁 SAFARI WEBULL\n\n🛡 Локальний захист: зачекай {seconds} сек. Це не запит до Webull."
-        )
+        await message.reply_text(f"🦁 SAFARI WEBULL\n\n🛡 Локальний захист: зачекай {seconds} сек. Це не запит до Webull.")
         return False
     webull_last_request_monotonic = now
     return True
 
 
-async def webull_auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context
+async def webull_auth(update: Update) -> None:
     if not update.message:
         return
     if not _webull_ready():
-        await update.message.reply_text(
-            "🦁 SAFARI WEBULL\n\n❌ Webull ключі не підключені або SDK не встановлено."
-        )
+        await update.message.reply_text("🦁 SAFARI WEBULL\n\n❌ Webull ключі не підключені або SDK не встановлено.")
         return
     if not await _webull_guard(update.message):
         return
-
+    assert webull_reader is not None
     async with webull_operation_lock:
-        status_message = await update.message.reply_text(
-            "🦁 SAFARI WEBULL AUTH\n\n🔐 Створюю рівно ОДИН запит авторизації. Автоматичних перевірок не буде."
-        )
+        status = await update.message.reply_text("🦁 SAFARI WEBULL AUTH\n\n🔐 Створюю рівно один запит авторизації.")
         try:
             result = await webull_reader.auth_start()
             token_status = clean_text(result.get("status"), "UNKNOWN").upper()
             if token_status == "NORMAL":
-                message = (
-                    "🦁 SAFARI WEBULL AUTH ✅\n\n"
-                    "Токен уже підтверджений.\n\n👉 Одна дія: напиши WEBULL."
-                )
+                text = "🦁 SAFARI WEBULL AUTH ✅\n\nТокен уже підтверджений.\n\n👉 Одна дія: напиши WEBULL."
             elif token_status == "PENDING":
-                message = (
-                    "🦁 SAFARI WEBULL AUTH\n\n"
-                    "📩 Один новий OpenAPI Notice створено.\n"
-                    "Відкрий Webull на телефоні → OpenAPI Notice → найновіше повідомлення → Confirm.\n\n"
-                    "👉 Після підтвердження напиши WEBULL CHECK один раз."
-                )
-            elif token_status in {"INVALID", "EXPIRED"}:
-                message = (
-                    f"🦁 SAFARI WEBULL AUTH\n\n❌ Статус токена: {token_status}.\n"
-                    "Не повторюй команду; покажи відповідь для перевірки."
-                )
+                text = "🦁 SAFARI WEBULL AUTH\n\n📩 Один OpenAPI Notice створено. Підтвердь його у Webull.\n\n👉 Потім один раз напиши WEBULL CHECK."
             else:
-                message = f"🦁 SAFARI WEBULL AUTH\n\n⚠️ Невідомий статус: {token_status}."
-            await status_message.edit_text(message)
+                text = f"🦁 SAFARI WEBULL AUTH\n\nСтатус токена: {token_status}."
+            await status.edit_text(text)
         except WebullReadOnlyError as error:
-            logger.warning("Webull auth start failed: %s", error.code)
-            if error.code == "RATE_LIMIT":
-                message = (
-                    "🦁 SAFARI WEBULL AUTH\n\n⏸ Webull повернув 429. SAFARI не робитиме повторів.\n\n"
-                    "👉 Нічого не натискай; покажи цю відповідь."
-                )
-            else:
-                message = f"🦁 SAFARI WEBULL AUTH\n\n❌ {error}"
-            await status_message.edit_text(message)
-        except Exception:
-            logger.exception("Unexpected Webull auth error")
-            await status_message.edit_text(
-                "🦁 SAFARI WEBULL AUTH\n\n❌ Неочікувана помилка. SAFARI не повторював запит автоматично."
-            )
+            await status.edit_text(f"🦁 SAFARI WEBULL AUTH\n\n❌ {error}")
 
 
-async def webull_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context
+async def webull_check(update: Update) -> None:
     if not update.message:
         return
     if not _webull_ready():
-        await update.message.reply_text(
-            "🦁 SAFARI WEBULL\n\n❌ Webull ключі не підключені або SDK не встановлено."
-        )
+        await update.message.reply_text("🦁 SAFARI WEBULL\n\n❌ Webull не налаштований.")
         return
     if not await _webull_guard(update.message):
         return
-
+    assert webull_reader is not None
     async with webull_operation_lock:
-        status_message = await update.message.reply_text(
-            "🦁 SAFARI WEBULL CHECK\n\n🔎 Виконую рівно ОДНУ перевірку токена."
-        )
+        status = await update.message.reply_text("🦁 SAFARI WEBULL CHECK\n\n🔎 Виконую одну перевірку токена.")
         try:
             result = await webull_reader.auth_check()
             token_status = clean_text(result.get("status"), "UNKNOWN").upper()
             if token_status == "NORMAL":
-                message = (
-                    "🦁 SAFARI WEBULL CHECK ✅\n\nАвторизацію підтверджено, токен збережено.\n\n"
-                    "👉 Одна дія: напиши WEBULL."
-                )
-            elif token_status == "PENDING":
-                message = (
-                    "🦁 SAFARI WEBULL CHECK\n\n⌛ Токен ще PENDING.\n"
-                    "Переконайся, що підтвердив найновіше OpenAPI Notice.\n\n"
-                    "👉 Не повторюй одразу; спочатку перевір застосунок Webull."
-                )
-            elif token_status in {"INVALID", "EXPIRED"}:
-                message = (
-                    f"🦁 SAFARI WEBULL CHECK\n\n❌ Статус: {token_status}.\n\n"
-                    "👉 Одна дія: напиши WEBULL AUTH один раз."
-                )
+                await status.edit_text("🦁 SAFARI WEBULL CHECK ✅\n\nАвторизація підтверджена.\n\n👉 Одна дія: напиши WEBULL.")
             else:
-                message = f"🦁 SAFARI WEBULL CHECK\n\n⚠️ Невідомий статус: {token_status}."
-            await status_message.edit_text(message)
+                await status.edit_text(f"🦁 SAFARI WEBULL CHECK\n\nСтатус: {token_status}. Автоматичних повторів немає.")
         except WebullReadOnlyError as error:
-            logger.warning("Webull auth check failed: %s", error.code)
-            if error.code == "RATE_LIMIT":
-                message = (
-                    "🦁 SAFARI WEBULL CHECK\n\n⏸ Webull повернув 429. SAFARI не робитиме повторів.\n\n"
-                    "👉 Нічого не натискай; покажи цю відповідь."
-                )
-            elif error.code == "NO_TOKEN":
-                message = "🦁 SAFARI WEBULL CHECK\n\n❌ Немає токена.\n\n👉 Напиши WEBULL AUTH один раз."
-            else:
-                message = f"🦁 SAFARI WEBULL CHECK\n\n❌ {error}"
-            await status_message.edit_text(message)
-        except Exception:
-            logger.exception("Unexpected Webull check error")
-            await status_message.edit_text(
-                "🦁 SAFARI WEBULL CHECK\n\n❌ Неочікувана помилка. Автоматичних повторів не було."
-            )
+            await status.edit_text(f"🦁 SAFARI WEBULL CHECK\n\n❌ {error}")
 
 
-async def webull_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context
+async def webull_status(update: Update) -> None:
     if not update.message or not update.effective_user:
         return
-    if not _webull_ready():
-        await update.message.reply_text(
-            "🦁 SAFARI WEBULL\n\n❌ Webull ключі не підключені або SDK не встановлено."
-        )
+    if not _webull_ready() or safari_ai is None:
+        await update.message.reply_text("🦁 SAFARI WEBULL\n\n❌ Webull або OpenAI не налаштовані.")
         return
     if not await _webull_guard(update.message):
         return
-
+    assert webull_reader is not None
     async with webull_operation_lock:
-        status_message = await update.message.reply_text(
-            "🦁 SAFARI WEBULL — READ ONLY\n\n📥 Читаю рахунок і позиції. Жодних торгових команд у коді немає."
-        )
+        status = await update.message.reply_text("🦁 SAFARI WEBULL — READ ONLY\n\n📥 Читаю рахунок і позиції. Торгових команд у коді немає.")
         try:
             snapshot = await webull_reader.account_snapshot()
-            analysis = await summarize_webull(snapshot)
-            update_state_from_webull(
-                update.effective_user.id,
-                analysis,
-                snapshot.get("fetched_at_utc"),
-            )
-            summary = clean_text(analysis.get("summary"), "Позиції прочитано.")
-            await status_message.edit_text(
+            normalized = await safari_ai.normalize_webull(snapshot)
+            analysis = _force_webull_sources(normalized.model_dump())
+            if not analysis.get("positions"):
+                analysis["summary"] = "Портфель не містить відкритих позицій. Поточних ризиків від відкритих позицій немає."
+                analysis["data_quality"] = "high"
+            update_state_from_webull(state_store, update.effective_user.id, analysis, snapshot.get("fetched_at_utc"))
+            await status.edit_text(
                 "🦁 SAFARI WEBULL — READ ONLY ✅\n"
-                f"🕒 {snapshot.get('fetched_at_utc')}\n\n{summary}\n\n"
-                "💾 GUARDIAN: позиції збережено локально."
+                f"🕒 {snapshot.get('fetched_at_utc')}\n\n"
+                f"{clean_text(analysis.get('summary'), 'Позиції прочитано.')}\n\n"
+                "💾 GUARDIAN: локальна пам’ять синхронізована."
             )
         except WebullReadOnlyError as error:
-            logger.warning("Webull read failed: %s", error.code)
             if error.code in {"NO_TOKEN", "TOKEN_NOT_READY", "INVALID_TOKEN"}:
-                message = (
-                    "🦁 SAFARI WEBULL\n\n🔐 Авторизація ще не готова або токен прострочений.\n\n"
-                    "👉 Одна дія: напиши WEBULL AUTH."
-                )
+                message = "🦁 SAFARI WEBULL\n\n🔐 Авторизація не готова або токен прострочений.\n\n👉 Одна дія: напиши WEBULL AUTH."
             elif error.code == "RATE_LIMIT":
-                message = (
-                    "🦁 SAFARI WEBULL\n\n⏸ Webull повернув 429. Автоматичних повторів не було.\n"
-                    f"📍 Етап: {error}\n\n"
-                    "👉 Нічого не натискай; покажи цю відповідь."
-                )
-            elif error.code == "UNAUTHORIZED":
-                message = (
-                    "🦁 SAFARI WEBULL\n\n❌ Webull відхилив авторизацію.\n\n"
-                    "👉 Одна дія: напиши WEBULL AUTH."
-                )
+                message = f"🦁 SAFARI WEBULL\n\n⏸ Webull повернув 429. Автоматичних повторів не було.\n📍 Етап: {error}"
             else:
                 message = f"🦁 SAFARI WEBULL\n\n❌ {error}"
-            await status_message.edit_text(message)
-        except Exception:
-            logger.exception("Unexpected Webull read error")
-            await status_message.edit_text(
-                "🦁 SAFARI WEBULL\n\n❌ Неочікувана помилка. Автоматичних повторів не було."
-            )
+            await status.edit_text(message)
+        except Exception as error:
+            logger.exception("Unexpected Webull read error: %s", error)
+            await status.edit_text("🦁 SAFARI WEBULL\n\n❌ Неочікувана помилка. Автоматичних повторів не було.")
 
 
-async def why_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context
-    if not update.message or not update.effective_user:
+# ---------------------------------------------------------------------------
+# Journal
+# ---------------------------------------------------------------------------
+
+
+async def close_trade_message(update: Update, text: str) -> None:
+    if not update.message or not update.effective_user or safari_ai is None:
         return
-    user = state_store.user(update.effective_user.id)
-    reason = clean_text(user.get("last_full_reason"), "")
-    if not reason:
-        await update.message.reply_text(
-            "🦁 SAFARI\n\nСпочатку надішли скріншот або запит TRADING/GUARDIAN."
-        )
-        return
-    await send_long_message(update.message, "🔍 ЧОМУ?\n\n" + reason)
-
-
-async def close_trade_message(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    text: str,
-) -> None:
-    del context
-    if not update.message or not update.effective_user:
-        return
-
     status = await update.message.reply_text("📚 SAFARI DOSSIER\n\nЗаписую угоду…")
     try:
-        record = await parse_closed_trade(text)
+        record = (await safari_ai.parse_closed_trade(text)).model_dump()
         record["closed_at_utc"] = utc_now()
         user = state_store.user(update.effective_user.id)
         user.setdefault("dossier", []).append(record)
-
-        ticker = clean_text(record.get("ticker"), "").upper()
-        if ticker:
-            positions = user.get("positions", {})
-            if isinstance(positions, dict):
-                keys_to_remove = [
-                    key for key in positions if key.upper().startswith(ticker + "|")
-                ]
-                for key in keys_to_remove:
-                    positions.pop(key, None)
-
+        # Do not delete every position of a ticker from an ambiguous sentence.
+        # A live WEBULL sync remains authoritative for position existence.
         state_store.update_user(update.effective_user.id, user)
         await status.edit_text(
             "📚 SAFARI DOSSIER — ЗАПИСАНО ✅\n\n"
             f"📈 {clean_text(record.get('ticker'))} {clean_text(record.get('instrument'))}\n"
-            f"📊 Результат: {money(record.get('result_amount'), 'не вказано')} / "
-            f"{percentage(record.get('result_percent'), 'не вказано')}\n"
-            f"🧠 Урок: {clean_text(record.get('lesson'), 'додай пізніше')}"
+            f"📊 Результат: {money(record.get('result_amount'), 'не вказано')} / {percentage(record.get('result_percent'), 'не вказано')}\n"
+            f"🧠 Урок: {clean_text(record.get('lesson'), 'додай пізніше')}\n\n"
+            "👉 Для очищення активних позицій виконай WEBULL."
         )
     except Exception as error:
         logger.exception("Could not record closed trade: %s", error)
         await status.edit_text(
-            "📚 SAFARI DOSSIER\n\n"
-            "❌ Не вдалося розібрати запис. Напиши, наприклад:\n"
-            "ЗАКРИВ SOFI $17 CALL +$120, урок — не входити на широкому spread."
+            "📚 SAFARI DOSSIER\n\n❌ Не вдалося розібрати запис. Напиши, наприклад:\n"
+            "ЗАКРИВ SOFI $17 CALL -$54; урок — не тримати 10 DTE без підтвердження."
         )
 
 
-async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.effective_user:
+# ---------------------------------------------------------------------------
+# Unified deterministic ingress
+# ---------------------------------------------------------------------------
+
+
+async def analyze_image_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    route_pending: PendingIntent | None,
+) -> None:
+    if not update.message or not update.effective_user or safari_ai is None:
         return
-
-    original = (update.message.text or "").strip()
-    normalized = original.casefold().strip()
-
-    if normalized in {"webull auth", "вебул auth", "вебул авторизація", "webull авторизація"}:
-        await webull_auth(update, context)
-        return
-
-    if normalized in {"webull check", "вебул check", "вебул перевірка", "webull перевірка"}:
-        await webull_check(update, context)
-        return
-
-    if normalized in {"webull", "вебул", "рахунок", "живі позиції"}:
-        await webull_status(update, context)
-        return
-
-    if normalized in {"мої позиції", "позиції", "my positions"}:
-        await send_long_message(
-            update.message,
-            format_local_positions(update.effective_user.id),
-        )
-        return
-
-    if normalized in {
-        "очистити дублі",
-        "очистити дублікати",
-        "прибрати дублі",
-        "cleanup duplicates",
-    }:
-        removed, preserved = remove_screenshot_position_duplicates(
-            update.effective_user.id
-        )
-        if removed:
-            await update.message.reply_text(
-                "🧹 SAFARI GUARDIAN — ОЧИЩЕНО ✅\n\n"
-                f"Видалено старих записів зі скрінів: {removed}.\n"
-                f"Живих позицій Webull збережено: {preserved}.\n\n"
-                "Жодних торгових дій не виконано."
-            )
-        else:
-            await update.message.reply_text(
-                "🧹 SAFARI GUARDIAN\n\n"
-                "Старих записів зі скрінів не знайдено. "
-                f"Живих позицій Webull: {preserved}."
-            )
-        return
-
-    if normalized in {"чому", "чому?", "why", "why?"}:
-        await why_message(update, context)
-        return
-
-    if normalized in {"досьє", "dossier", "журнал"}:
-        await send_long_message(update.message, format_dossier(update.effective_user.id))
-        return
-
-    if normalized.startswith(("закрив", "закрила", "closed ", "close ")):
-        await close_trade_message(update, context, original)
-        return
-
-    if normalized.startswith(("трейдинг", "trading")):
-        await update.message.reply_text(
-            "🎯 SAFARI TRADING\n\n"
-            "Щоб дати strike, expiry і премію без вигадок, надішли скріншот "
-            "опціонного ланцюга, де видно Bid/Ask, OI, Volume, IV і Greeks.\n\n"
-            "👉 Одна дія: надішли option chain screenshot."
-        )
-        return
-
-    if normalized.startswith(("guardian", "гардіан")):
-        await update.message.reply_text(
-            "🛡 SAFARI GUARDIAN\n\n"
-            "Надішли скріншот відкритої позиції або напиши WEBULL."
-        )
-        return
-
-    await update.message.reply_text(
-        "🦁 SAFARI\n\n"
-        "Надішли торговий скріншот або напиши: WEBULL, МОЇ ПОЗИЦІЇ, ЧОМУ?, ДОСЬЄ."
-    )
-
-
-async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.photo or not update.effective_user:
-        return
-
     status = await update.message.reply_text(
-        "🦁 SAFARI 1.4.3 SOURCE BRIDGE\n\n👁️ Читаю дані й спочатку шукаю причини проти…"
+        f"🦁 SAFARI {SAFARI_VERSION}\n\n👁️ Читаю лише видимі факти; рішення перевірить deterministic core…"
     )
-
-    destination: Path | None = None
+    path: Path | None = None
+    incident = f"u{update.update_id}-m{update.message.message_id}"
     try:
-        photo = update.message.photo[-1]
-        remote_file = await context.bot.get_file(photo.file_id)
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
-        destination = SCREENSHOT_DIR / f"{update.effective_user.id}_{stamp}.jpg"
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        await remote_file.download_to_drive(custom_path=str(destination))
-
-        analysis = await analyze_screenshot(
-            destination,
+        path = await _download_image(update, context)
+        _increment_pending_attempt(update.effective_user.id, route_pending)
+        extraction = await safari_ai.extract_screenshot(
+            path,
             caption=update.message.caption or "",
+            pending=route_pending,
         )
-        update_state_from_analysis(update.effective_user.id, analysis)
+        analysis = build_analysis(
+            extraction,
+            caption=update.message.caption or "",
+            pending=route_pending,
+            user_timezone=USER_TIMEZONE,
+        )
+        update_state_from_analysis(state_store, update.effective_user.id, analysis)
+        state_store.audit(
+            update.effective_user.id,
+            {
+                "incident": incident,
+                "route": "ANALYZE_IMAGE",
+                "mode": analysis.get("mode"),
+                "screen_type": analysis.get("screen_type"),
+                "data_quality": analysis.get("data_quality"),
+            },
+        )
         formatted = format_analysis(analysis)
-
         if len(formatted) <= MAX_TELEGRAM_MESSAGE:
             await status.edit_text(formatted)
         else:
             await status.edit_text(formatted[:MAX_TELEGRAM_MESSAGE])
             await send_long_message(update.message, formatted[MAX_TELEGRAM_MESSAGE:])
-
     except Exception as error:
-        logger.exception("Screenshot analysis failed: %s", error)
+        logger.exception("Image analysis failed incident=%s: %s", incident, error)
         await status.edit_text(
-            "🦁 SAFARI\n\n"
-            "❌ Не вдалося проаналізувати скріншот. Перевір, щоб текст був чітким, "
-            "і надішли ще раз."
+            "🦁 SAFARI VISION\n\n"
+            f"❌ Не вдалося обробити саме зображення. Код події: {incident}.\n"
+            "Текстові команди при цьому не маршрутизуються в VISION."
         )
     finally:
-        # Keep screenshots for current runtime debugging only; do not accumulate forever.
-        if destination and destination.exists():
+        if path and path.exists():
             try:
-                destination.unlink()
+                path.unlink()
             except OSError:
                 pass
+
+
+async def ingress_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    text, caption, has_photo, has_image_document = _message_content(update)
+    stored_pending = state_store.pending(update.effective_user.id)
+    decision = route_envelope(
+        text=text,
+        caption=caption,
+        has_photo=has_photo,
+        has_image_document=has_image_document,
+        pending=stored_pending,
+    )
+    logger.info(
+        "ROUTER update_id=%s message_id=%s user=%s route=%s has_photo=%s has_image_document=%s pending=%s",
+        update.update_id,
+        update.message.message_id,
+        update.effective_user.id,
+        decision.route,
+        has_photo,
+        has_image_document,
+        bool(stored_pending),
+    )
+    state_store.audit(update.effective_user.id, {"route": decision.route, "message_id": update.message.message_id})
+
+    if decision.route == "ANALYZE_IMAGE":
+        explicit = _pending_from_decision(decision.command, decision.ticker, decision.instrument)
+        pending = explicit or stored_pending
+        if explicit:
+            state_store.set_pending(update.effective_user.id, explicit)
+        await analyze_image_message(update, context, route_pending=pending)
+        return
+
+    if decision.route == "SET_TRADING_INTENT":
+        pending = make_pending_intent("TRADING", decision.ticker, decision.instrument or "UNKNOWN")
+        state_store.set_pending(update.effective_user.id, pending)
+        await update.message.reply_text(
+            "🎯 SAFARI TRADING — КОНТЕКСТ ЗБЕРЕЖЕНО ✅\n\n"
+            f"Ідея: {pending.ticker} {pending.instrument}\n"
+            "Наступний скрін буде перевірено саме для цієї ідеї.\n\n"
+            "👉 Надішли option chain, де видно expiry, strike, Bid/Ask, OI, Volume, IV і Greeks."
+        )
+        return
+
+    if decision.route == "SET_GUARDIAN_INTENT":
+        pending = make_pending_intent("GUARDIAN", decision.ticker, "UNKNOWN")
+        state_store.set_pending(update.effective_user.id, pending)
+        await update.message.reply_text("🛡 SAFARI GUARDIAN\n\nКонтекст збережено.\n\n👉 Надішли свіжий скрін відкритої позиції.")
+        return
+
+    if decision.route == "INCOMPLETE_TRADING":
+        await update.message.reply_text("🎯 SAFARI TRADING\n\nВкажи тикер і напрямок. Приклад:\nТРЕЙДИНГ TSLA CALL")
+        return
+    if decision.route == "AMBIGUOUS_TEXT":
+        await update.message.reply_text("🦁 SAFARI ROUTER\n\nУ повідомленні кілька команд.\n\n👉 Надішли лише одну команду за раз.")
+        return
+    if decision.route == "WEBULL":
+        await webull_status(update)
+        return
+    if decision.route == "WEBULL_AUTH":
+        await webull_auth(update)
+        return
+    if decision.route == "WEBULL_CHECK":
+        await webull_check(update)
+        return
+    if decision.route == "POSITIONS":
+        await send_long_message(update.message, format_local_positions(state_store, update.effective_user.id))
+        return
+    if decision.route == "WHY":
+        await why_message(update)
+        return
+    if decision.route == "DOSSIER":
+        await send_long_message(update.message, format_dossier(state_store, update.effective_user.id))
+        return
+    if decision.route == "CLEANUP":
+        removed, preserved = remove_screenshot_position_duplicates(state_store, update.effective_user.id)
+        await update.message.reply_text(
+            "🧹 SAFARI GUARDIAN\n\n"
+            f"Видалено screenshot-записів: {removed}.\n"
+            f"Збережено Webull-позицій: {preserved}.\n"
+            "Жодних торгових дій не виконано."
+        )
+        return
+    if decision.route == "CANCEL_PENDING":
+        state_store.set_pending(update.effective_user.id, None)
+        await update.message.reply_text("🦁 SAFARI ROUTER\n\nОчікуваний скрін скасовано ✅")
+        return
+    if decision.route == "STATUS":
+        await status_command(update)
+        return
+    if decision.route == "SELFTEST":
+        failures = startup_self_check()
+        await update.message.reply_text(
+            "🧪 SAFARI SELFTEST\n\n" + ("✅ Core invariants passed." if not failures else "❌ " + "; ".join(failures))
+        )
+        return
+    if decision.route == "CLOSE_TRADE":
+        await close_trade_message(update, text or "")
+        return
+    if decision.route == "FALLBACK_TEXT":
+        await update.message.reply_text(
+            "🦁 SAFARI ROUTER\n\nКоманду не розпізнано.\n\n"
+            "Приклад: ТРЕЙДИНГ TSLA CALL, WEBULL, МОЇ ПОЗИЦІЇ, ЧОМУ?, ДОСЬЄ."
+        )
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled Telegram error update=%s", getattr(update, "update_id", "unknown"), exc_info=context.error)
+
+
+# Slash commands remain convenience aliases. Normal Ukrainian commands use ingress.
+async def slash_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await start(update, context)
+
+
+async def slash_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    del context
+    await status_command(update)
+
+
+async def slash_webull(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    del context
+    await webull_status(update)
+
+
+async def slash_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    del context
+    if update.message and update.effective_user:
+        await send_long_message(update.message, format_local_positions(state_store, update.effective_user.id))
 
 
 def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
     WEBULL_TOKEN_DIR.mkdir(parents=True, exist_ok=True)
-
+    failures = startup_self_check()
+    if failures:
+        raise RuntimeError("SAFARI startup self-check failed: " + "; ".join(failures))
     if not BOT_TOKEN:
         raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
     if not OPENAI_API_KEY:
@@ -2088,22 +590,26 @@ def main() -> None:
         raise RuntimeError("SAFARI must remain read-only")
 
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("webull", webull_status))
-    app.add_handler(CommandHandler("webull_auth", webull_auth))
-    app.add_handler(CommandHandler("webull_check", webull_check))
-    app.add_handler(CommandHandler("positions", positions_command))
-    app.add_handler(CommandHandler("why", why_message))
-    app.add_handler(CommandHandler("dossier", dossier_command))
-    app.add_handler(MessageHandler(filters.PHOTO, photo_message))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
+    app.add_handler(CommandHandler("start", slash_start))
+    app.add_handler(CommandHandler("help", slash_start))
+    app.add_handler(CommandHandler("status", slash_status))
+    app.add_handler(CommandHandler("webull", slash_webull))
+    app.add_handler(CommandHandler("positions", slash_positions))
+    # One non-command ingress handler eliminates overlapping photo/text routing.
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, ingress_message))
+    app.add_error_handler(error_handler)
 
     logger.info(
-        "SAFARI 1.4.3 SOURCE BRIDGE started | read_only=%s | webull_configured=%s | data_dir=%s",
+        "SAFARI %s started | read_only=%s | router=single_ingress | webull_configured=%s | data_dir=%s | "
+        "openai=%s | telegram=%s | pydantic=%s | model=%s",
+        SAFARI_VERSION,
         READ_ONLY_MODE,
-        bool(WEBULL_APP_KEY and WEBULL_APP_SECRET),
+        bool(webull_reader and webull_reader.enabled),
         DATA_DIR,
+        package_ver("openai"),
+        package_ver("python-telegram-bot"),
+        package_ver("pydantic"),
+        OPENAI_MODEL,
     )
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

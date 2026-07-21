@@ -1,0 +1,35 @@
+SAFARI 1.5.0 STABILITY CORE
+
+PURPOSE
+- Replace reactive one-bug patches with a deterministic stability baseline.
+
+FIXED
+- Text TRADING commands can no longer be routed into screenshot analysis.
+- Photo, image-document and photo+caption inputs use one ingress router.
+- TRADING ticker/direction context persists until screenshot, cancellation or timeout.
+- Ticker or CALL/PUT mismatch forces WAIT.
+- Platform is not guessed from dark/light UI style.
+- Data quality cannot be high when critical fields are absent.
+- Missing labeled OI/Volume prevents a high-quality verdict.
+- 0-3 DTE is high risk and PASS for new long-option entries.
+- Earnings proximity is a deterministic hard stop.
+- Stock order-ticket price/quantity cannot be used as option premium/quantity.
+- Underlying price, option premium and contract fields have separate scopes.
+- Break-even is never presented as a current stop.
+- GUARDIAN messages no longer contain a hardcoded SOFI reference.
+- Webull identity fields survive fresh-screenshot market updates.
+- Empty Webull portfolio clears local active positions.
+- Close-trade journal text no longer deletes all contracts of a ticker.
+
+SAFETY
+- READ ONLY invariant is checked at startup.
+- Webull adapter contains no order execution interface.
+- No automatic Webull retry loop.
+- Startup fails closed if core invariants fail.
+
+VERIFICATION
+- 27 offline regression tests.
+- Python compile check passed.
+- Ruff lint passed.
+- mypy static type check passed.
+- Structured-output schema check passed.
