@@ -1,4 +1,4 @@
-# 🦁 SAFARI 1.2 RATE-LIMIT SAFE
+# 🦁 SAFARI 1.3 MEMORY BRIDGE
 
 Read-only Telegram trading copilot. No order placement, replacement, cancellation, or execution calls.
 
@@ -29,3 +29,8 @@ Optional:
 ## Safe test
 
 After deployment is Active, send `WEBULL` exactly once. If Webull returns 429, do not repeat it. The bot response and Railway logs will identify the exact failed operation.
+
+
+## Memory bridge
+
+After a successful `WEBULL` read, live positions are saved into GUARDIAN local memory. `МОЇ ПОЗИЦІЇ` shows the latest saved positions, and `ЧОМУ?` can use the latest Webull reasoning. Webull remains read-only; no automatic retries are added.

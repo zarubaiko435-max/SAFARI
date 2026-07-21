@@ -1,4 +1,4 @@
-"""SAFARI 1.2 — rate-limit-safe read-only trading copilot for Telegram.
+"""SAFARI 1.3 — Webull-to-GUARDIAN memory bridge, read-only trading copilot.
 
 Safety contract:
 - Reads screenshots and Webull account/position data.
@@ -532,7 +532,7 @@ webull_last_request_monotonic = 0.0
 # ---------------------------------------------------------------------------
 
 SCREENSHOT_ANALYSIS_PROMPT = r"""
-Ти — 🦁 SAFARI 1.2, read-only Trading Copilot.
+Ти — 🦁 SAFARI 1.3, read-only Trading Copilot.
 Ти НІКОЛИ не відкриваєш, не змінюєш і не закриваєш угоди. Лише читаєш,
 аналізуєш і даєш рекомендацію, остаточне рішення завжди за трейдером.
 
@@ -638,14 +638,43 @@ SCREENSHOT_ANALYSIS_PROMPT = r"""
 WEBULL_SUMMARY_PROMPT = r"""
 Ти — 🦁 SAFARI GUARDIAN у режимі ТІЛЬКИ ЧИТАННЯ.
 Нижче передані сирі дані account positions/balance з Webull OpenAPI.
-Не показуй account IDs, внутрішні IDs або зайві службові поля.
-Не вигадуй новини, OI, flow чи цілі, яких немає в даних.
-Спочатку знайди ризики. Для кожної відкритої позиції дай стисло:
-тикер/контракт, кількість, середній вхід, поточну вартість, P/L,
-якість даних, і тільки обережний статус HOLD/REDUCE/EXIT/WAIT.
-Якщо для рішення немає графіка/тези/ринкового контексту — WAIT і скажи,
-який скріншот потрібен. Заверши однією конкретною дією.
-Відповідай українською. Не рекомендуй автоматичне виконання угод.
+
+ПРАВИЛА:
+1) Не показуй account IDs, внутрішні IDs або зайві службові поля.
+2) Не вигадуй новини, OI, flow, Greeks, цілі або рівні, яких немає в даних.
+3) Спочатку знайди ризики.
+4) Якщо немає графіка, тези або ринкового контексту — рішення WAIT.
+5) Відповідай українською.
+6) Не рекомендуй автоматичне виконання угод.
+7) ПОВЕРНИ ЛИШЕ ВАЛІДНИЙ JSON без markdown.
+
+СХЕМА:
+{
+  "summary": "готовий текст для Telegram: стислий аналіз усіх відкритих позицій, ризики, рішення і одна конкретна дія",
+  "data_quality": "high|medium|low",
+  "positions": [
+    {
+      "ticker": "string|null",
+      "instrument": "STOCK|CALL|PUT|UNKNOWN",
+      "strike": {"value": "number|string|null", "source": "api|calculated|missing"},
+      "expiration": {"value": "string|null", "source": "api|calculated|missing"},
+      "quantity": {"value": "number|string|null", "source": "api|calculated|missing"},
+      "entry_price": {"value": "number|string|null", "source": "api|calculated|missing"},
+      "total_cost": {"value": "number|string|null", "source": "api|calculated|missing"},
+      "current_premium": {"value": "number|string|null", "source": "api|calculated|missing"},
+      "market_value": {"value": "number|string|null", "source": "api|calculated|missing"},
+      "pnl": {"value": "number|string|null", "source": "api|calculated|missing"},
+      "pnl_percent": {"value": "number|string|null", "source": "api|calculated|missing"}
+    }
+  ],
+  "guardian": {
+    "decision": "HOLD|REDUCE|EXIT|WAIT",
+    "risk": "low|medium|high|unknown",
+    "why_full": "детальне доказове пояснення: окремо факти з API та обережні висновки"
+  }
+}
+
+Якщо відкритих позицій немає, positions має бути порожнім списком, а summary має це прямо сказати.
 """.strip()
 
 TEXT_CLOSE_PROMPT = r"""
@@ -690,7 +719,7 @@ async def analyze_screenshot(image_path: Path, caption: str = "") -> dict[str, A
     return extract_json_object(response.output_text)
 
 
-async def summarize_webull(snapshot: dict[str, Any]) -> str:
+async def summarize_webull(snapshot: dict[str, Any]) -> dict[str, Any]:
     response = await openai_client.responses.create(
         model=OPENAI_MODEL,
         input=[
@@ -705,11 +734,13 @@ async def summarize_webull(snapshot: dict[str, Any]) -> str:
                 ],
             }
         ],
-        max_output_tokens=1700,
+        max_output_tokens=2400,
     )
-    result = response.output_text.strip()
-    if not result:
-        raise RuntimeError("Empty Webull summary")
+    result = extract_json_object(response.output_text)
+    if not isinstance(result.get("positions"), list):
+        raise RuntimeError("Webull analysis contains no positions list")
+    if not clean_text(result.get("summary"), ""):
+        raise RuntimeError("Webull analysis contains no summary")
     return result
 
 
@@ -748,6 +779,7 @@ def value_with_source(field: Any, formatter: str = "text") -> str:
         rendered = clean_text(value)
     source_labels = {
         "visible": "видно",
+        "api": "Webull",
         "calculated": "розраховано",
         "missing": "не видно",
     }
@@ -792,6 +824,66 @@ def update_state_from_analysis(user_id: int, analysis: dict[str, Any]) -> None:
                 }
 
     state_store.update_user(user_id, user)
+
+
+def update_state_from_webull(
+    user_id: int,
+    analysis: dict[str, Any],
+    fetched_at_utc: Any,
+) -> None:
+    """Persist the latest live Webull positions into GUARDIAN memory.
+
+    Webull-sourced entries are replaced on each successful read so closed
+    positions do not remain stale. Screenshot-sourced entries are preserved.
+    """
+    user = state_store.user(user_id)
+    user["last_analysis"] = {
+        "mode": "GUARDIAN",
+        "platform": "Webull OpenAPI",
+        "data_quality": analysis.get("data_quality", "low"),
+        "positions": analysis.get("positions", []),
+        "guardian": analysis.get("guardian", {}),
+        "data_timestamp": clean_text(fetched_at_utc, utc_now()),
+    }
+
+    guardian = analysis.get("guardian")
+    if isinstance(guardian, dict):
+        user["last_full_reason"] = clean_text(guardian.get("why_full"), "")
+
+    position_store = user.setdefault("positions", {})
+    if not isinstance(position_store, dict):
+        position_store = {}
+        user["positions"] = position_store
+
+    stale_webull_keys = [
+        key
+        for key, item in position_store.items()
+        if isinstance(item, dict) and item.get("source") == "Webull OpenAPI"
+    ]
+    for key in stale_webull_keys:
+        position_store.pop(key, None)
+
+    positions = analysis.get("positions", [])
+    if isinstance(positions, list):
+        for position in positions:
+            if not isinstance(position, dict):
+                continue
+            key = position_key(position)
+            position_store[key] = {
+                "position": position,
+                "guardian": analysis.get("guardian", {}),
+                "hard_stops": [],
+                "data_quality": analysis.get("data_quality", "low"),
+                "updated_at_utc": clean_text(fetched_at_utc, utc_now()),
+                "source": "Webull OpenAPI",
+            }
+
+    state_store.update_user(user_id, user)
+    logger.info(
+        "GUARDIAN_MEMORY saved source=Webull positions=%s user=%s",
+        len(positions) if isinstance(positions, list) else 0,
+        user_id,
+    )
 
 
 def hard_stop_lines(analysis: dict[str, Any]) -> list[str]:
@@ -1010,7 +1102,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         else "⚠️ Пам’ять: тимчасова — потрібен Railway Volume"
     )
     await update.message.reply_text(
-        "🦁 SAFARI 1.2 на зв’язку.\n\n"
+        "🦁 SAFARI 1.3 на зв’язку.\n\n"
         "Тільки читання, аналіз і рекомендації. Автоматичних угод немає.\n\n"
         "Команди:\n"
         "• надішли скріншот — VISION + TRADING/GUARDIAN\n"
@@ -1185,7 +1277,7 @@ async def webull_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def webull_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     del context
-    if not update.message:
+    if not update.message or not update.effective_user:
         return
     if not _webull_ready():
         await update.message.reply_text(
@@ -1201,10 +1293,17 @@ async def webull_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         try:
             snapshot = await webull_reader.account_snapshot()
-            summary = await summarize_webull(snapshot)
+            analysis = await summarize_webull(snapshot)
+            update_state_from_webull(
+                update.effective_user.id,
+                analysis,
+                snapshot.get("fetched_at_utc"),
+            )
+            summary = clean_text(analysis.get("summary"), "Позиції прочитано.")
             await status_message.edit_text(
                 "🦁 SAFARI WEBULL — READ ONLY ✅\n"
-                f"🕒 {snapshot.get('fetched_at_utc')}\n\n{summary}"
+                f"🕒 {snapshot.get('fetched_at_utc')}\n\n{summary}\n\n"
+                "💾 GUARDIAN: позиції збережено локально."
             )
         except WebullReadOnlyError as error:
             logger.warning("Webull read failed: %s", error.code)

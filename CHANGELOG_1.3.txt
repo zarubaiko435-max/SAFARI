@@ -1,0 +1,15 @@
+SAFARI 1.3 — MEMORY BRIDGE
+
+Fixed:
+- A successful WEBULL read now saves live positions into GUARDIAN local memory.
+- МОЇ ПОЗИЦІЇ now reads the latest successfully saved Webull positions.
+- ЧОМУ? now can use the latest Webull GUARDIAN reasoning.
+- Old Webull-sourced positions are replaced after each successful live read to avoid stale records.
+- Screenshot-sourced positions are preserved.
+
+Safety preserved:
+- Read-only Webull access only.
+- No order placement, modification, cancellation, replacement, or execution calls.
+- No automatic Webull retries.
+- Existing rate-limit spacing and exact 429 reporting preserved.
+- Railway Volume persistence preserved.
