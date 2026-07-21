@@ -1,4 +1,4 @@
-"""SAFARI 1.4 CORE FIX — deterministic expiry/theta guardrails, read-only trading copilot.
+"""SAFARI 1.4.1 DATA GUARD — freshness and label guardrails, read-only trading copilot.
 
 Safety contract:
 - Reads screenshots and Webull account/position data.
@@ -534,7 +534,7 @@ webull_last_request_monotonic = 0.0
 # ---------------------------------------------------------------------------
 
 SCREENSHOT_ANALYSIS_PROMPT = r"""
-Ти — 🦁 SAFARI 1.4 CORE FIX, read-only Trading Copilot.
+Ти — 🦁 SAFARI 1.4.1 DATA GUARD, read-only Trading Copilot.
 Ти НІКОЛИ не відкриваєш, не змінюєш і не закриваєш угоди. Лише читаєш,
 аналізуєш і даєш рекомендацію, остаточне рішення завжди за трейдером.
 
@@ -562,13 +562,18 @@ SCREENSHOT_ANALYSIS_PROMPT = r"""
 11) Break Even опціону — це беззбитковість НА ЕКСПІРАЦІЮ, а не поточний стоп і не інвалідація.
 12) Якщо до експірації 14 днів або менше, не називай термін «тривалим» або «далеким»; Theta-ризик підвищений.
 13) Якщо інтерфейс упізнається як Webull (Open P&L, Day's P&L, Position Ratio, Sell to Close), platform = "Webull".
+14) Годинник у статус-барі телефона НЕ є timestamp ринкових даних. data_timestamp заповнюй лише тоді, коли дата/час явно показані всередині торгового застосунку.
+15) Числа безпосередньо під/біля Bid та Ask можуть бути Bid size / Ask size. НІКОЛИ не називай їх OI / Volume без окремих видимих підписів Open Interest/OI та Volume/Vol.
+16) Для open_interest і volume встановлюй label_visible=true лише коли відповідний підпис явно видно поруч із числом. Інакше value=null, source="missing", label_visible=false.
+17) Якщо актуальність скріншота не підтверджена повною датою всередині застосунку або підписом користувача «СВІЖИЙ/LIVE», не видавай поточне HOLD/REDUCE/EXIT: рішення WAIT, а дія — запросити свіжий скрін.
 
 ПОВЕРНИ ЛИШЕ ВАЛІДНИЙ JSON, без markdown, за схемою:
 {
   "mode": "GUARDIAN|TRADING|UNKNOWN",
   "platform": "string|null",
   "data_quality": "high|medium|low",
-  "data_timestamp": "видимий час або null",
+  "data_timestamp": "дата/час усередині торгового застосунку або null",
+  "data_freshness": "confirmed_current|user_confirmed|unconfirmed|stale",
   "positions": [
     {
       "ticker": "string|null",
@@ -585,8 +590,10 @@ SCREENSHOT_ANALYSIS_PROMPT = r"""
       "underlying_price": {"value": "number|string|null", "source": "visible|calculated|missing"},
       "bid": {"value": "number|string|null", "source": "visible|calculated|missing"},
       "ask": {"value": "number|string|null", "source": "visible|calculated|missing"},
-      "open_interest": {"value": "number|string|null", "source": "visible|calculated|missing"},
-      "volume": {"value": "number|string|null", "source": "visible|calculated|missing"},
+      "bid_size": {"value": "number|string|null", "source": "visible|calculated|missing"},
+      "ask_size": {"value": "number|string|null", "source": "visible|calculated|missing"},
+      "open_interest": {"value": "number|string|null", "source": "visible|calculated|missing", "label_visible": "boolean"},
+      "volume": {"value": "number|string|null", "source": "visible|calculated|missing", "label_visible": "boolean"},
       "delta": {"value": "number|string|null", "source": "visible|calculated|missing"},
       "gamma": {"value": "number|string|null", "source": "visible|calculated|missing"},
       "theta": {"value": "number|string|null", "source": "visible|calculated|missing"},
@@ -759,8 +766,167 @@ def _hard_stop(analysis: dict[str, Any], name: str) -> dict[str, Any]:
     return item
 
 
-def enforce_core_guardrails(analysis: dict[str, Any]) -> dict[str, Any]:
-    """Deterministic corrections for expiry, theta and break-even semantics."""
+def parse_visible_data_date(value: Any) -> datetime | None:
+    """Parse a full date shown inside the trading app; time-only values are insufficient."""
+    text = clean_text(value, "").strip()
+    if not text:
+        return None
+
+    patterns = [
+        r"\b(20\d{2})-(\d{1,2})-(\d{1,2})\b",
+        r"\b(\d{1,2})/(\d{1,2})/(20\d{2})\b",
+        r"\b(\d{1,2})[.](\d{1,2})[.](20\d{2})\b",
+    ]
+    match = re.search(patterns[0], text)
+    if match:
+        year, month, day = map(int, match.groups())
+        try:
+            return datetime(year, month, day, tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
+    match = re.search(patterns[1], text)
+    if match:
+        month, day, year = map(int, match.groups())
+        try:
+            return datetime(year, month, day, tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
+    match = re.search(patterns[2], text)
+    if match:
+        day, month, year = map(int, match.groups())
+        try:
+            return datetime(year, month, day, tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
+    month_first = re.search(
+        r"\b([A-Za-z]{3,9})\s+(\d{1,2})(?:,)?\s+(20\d{2})\b",
+        text,
+    )
+    if month_first:
+        month = _MONTHS.get(month_first.group(1).lower())
+        if month:
+            try:
+                return datetime(
+                    int(month_first.group(3)), month, int(month_first.group(2)), tzinfo=timezone.utc
+                )
+            except ValueError:
+                return None
+
+    day_first = re.search(
+        r"\b(\d{1,2})\s+([A-Za-z]{3,9})\s+(20\d{2})\b",
+        text,
+    )
+    if day_first:
+        month = _MONTHS.get(day_first.group(2).lower())
+        if month:
+            try:
+                return datetime(
+                    int(day_first.group(3)), month, int(day_first.group(1)), tzinfo=timezone.utc
+                )
+            except ValueError:
+                return None
+    return None
+
+
+def caption_confirms_freshness(caption: str) -> bool:
+    normalized = re.sub(r"\s+", " ", (caption or "").strip().lower())
+    return bool(
+        re.search(
+            r"(?:^|\b)(свіжий|свіжа|свіже|свежий|свежая|live|current|today|сьогодні)(?:\b|$)",
+            normalized,
+            flags=re.I,
+        )
+    )
+
+
+def _set_missing_field(position: dict[str, Any], name: str) -> None:
+    position[name] = {"value": None, "source": "missing", "label_visible": False}
+
+
+def enforce_data_guard(analysis: dict[str, Any], caption: str = "") -> dict[str, Any]:
+    """Block stale/unverified recommendations and prevent Bid/Ask size from becoming OI/Volume."""
+    positions = analysis.get("positions")
+    position = positions[0] if isinstance(positions, list) and positions and isinstance(positions[0], dict) else None
+
+    if position is not None:
+        for name in ("open_interest", "volume"):
+            field = position.get(name)
+            label_visible = isinstance(field, dict) and field.get("label_visible") is True
+            if not label_visible:
+                _set_missing_field(position, name)
+
+        oi = safe_float((position.get("open_interest") or {}).get("value"))
+        volume = safe_float((position.get("volume") or {}).get("value"))
+        liquidity = _hard_stop(analysis, "low_liquidity")
+        if oi is None or volume is None:
+            liquidity.update(
+                status="not_checked",
+                evidence="OI/Volume не підтверджені окремими видимими підписами; Bid/Ask size не замінює їх.",
+            )
+            missing = analysis.setdefault("missing_critical_data", [])
+            if not isinstance(missing, list):
+                missing = []
+                analysis["missing_critical_data"] = missing
+            for item in ("open_interest", "volume"):
+                if item not in missing:
+                    missing.append(item)
+
+    timestamp = clean_text(analysis.get("data_timestamp"), "")
+    visible_date = parse_visible_data_date(timestamp)
+    today = datetime.now(timezone.utc).date()
+
+    if visible_date is not None:
+        delta_days = (visible_date.date() - today).days
+        if delta_days == 0:
+            freshness = "confirmed_current"
+        elif delta_days < 0:
+            freshness = "stale"
+        else:
+            freshness = "unconfirmed"
+    elif caption_confirms_freshness(caption):
+        freshness = "user_confirmed"
+    else:
+        freshness = "unconfirmed"
+
+    analysis["data_freshness"] = freshness
+    stale_stop = _hard_stop(analysis, "stale_data")
+    guardian = analysis.setdefault("guardian", {})
+    if not isinstance(guardian, dict):
+        guardian = {}
+        analysis["guardian"] = guardian
+
+    if freshness in {"confirmed_current", "user_confirmed"}:
+        stale_stop.update(status="clear", evidence="Актуальність підтверджена датою в застосунку або підписом СВІЖИЙ/LIVE.")
+    else:
+        evidence = (
+            f"На скріншоті дата {visible_date.date().isoformat()}, сьогодні {today.isoformat()}."
+            if freshness == "stale" and visible_date is not None
+            else "Повної дати ринкових даних не видно; час у статус-барі телефона не підтверджує актуальність."
+        )
+        stale_stop.update(status="triggered", evidence=evidence)
+        guardian["decision"] = "WAIT"
+        guardian["one_action"] = "Надішли свіжий скрін із підписом СВІЖИЙ; до цього торгове рішення не змінювати."
+        guardian["why_short"] = "Актуальність даних не підтверджена, тому SAFARI не видає поточне HOLD/REDUCE/EXIT."
+        existing_why = clean_text(guardian.get("why_full"), "")
+        guard_text = (
+            "DATA GUARD: актуальність скріншота не підтверджена. "
+            "Час у статус-барі телефона не є timestamp ринкових даних. "
+            "Торгове рішення за цими даними не видається."
+        )
+        guardian["why_full"] = (guard_text + (" " + existing_why if existing_why else "")).strip()
+        analysis["data_quality"] = "low" if freshness == "stale" else "medium"
+
+    note = clean_text(analysis.get("note"), "")
+    data_note = "DATA GUARD: freshness and OI/Volume labels checked deterministically."
+    analysis["note"] = (note + " " + data_note).strip()
+    return analysis
+
+
+def enforce_core_guardrails(analysis: dict[str, Any], caption: str = "") -> dict[str, Any]:
+    """Deterministic corrections for expiry, theta, break-even, freshness and labels."""
     positions = analysis.get("positions")
     if not isinstance(positions, list) or not positions:
         return analysis
@@ -834,7 +1000,7 @@ def enforce_core_guardrails(analysis: dict[str, Any]) -> dict[str, Any]:
         "CORE FIX: строк до експірації та значення break-even перевірені кодом, а не лише мовною моделлю."
     )
     analysis["note"] = (note + " " + deterministic_note).strip()
-    return analysis
+    return enforce_data_guard(analysis, caption=caption)
 
 
 async def analyze_screenshot(image_path: Path, caption: str = "") -> dict[str, Any]:
@@ -864,7 +1030,7 @@ async def analyze_screenshot(image_path: Path, caption: str = "") -> dict[str, A
         max_output_tokens=2400,
     )
     analysis = extract_json_object(response.output_text)
-    return enforce_core_guardrails(analysis)
+    return enforce_core_guardrails(analysis, caption=caption)
 
 
 async def summarize_webull(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -954,7 +1120,10 @@ def update_state_from_analysis(user_id: int, analysis: dict[str, Any]) -> None:
     if isinstance(detail, dict):
         user["last_full_reason"] = clean_text(detail.get("why_full"), "")
 
-    if mode == "GUARDIAN":
+    if mode == "GUARDIAN" and clean_text(analysis.get("data_freshness"), "unconfirmed") in {
+        "confirmed_current",
+        "user_confirmed",
+    }:
         positions = analysis.get("positions")
         if isinstance(positions, list):
             position_store = user.setdefault("positions", {})
@@ -1042,6 +1211,7 @@ def hard_stop_lines(analysis: dict[str, Any]) -> list[str]:
         "earnings_risk": "ризик earnings",
         "poor_risk_reward": "поганий risk/reward",
         "conflicting_data": "суперечливі дані",
+        "stale_data": "актуальність даних",
     }
     icons = {"triggered": "🛑", "clear": "✅", "not_checked": "⚪"}
     lines: list[str] = []
@@ -1070,7 +1240,20 @@ def format_analysis(analysis: dict[str, Any]) -> str:
         "UNKNOWN": "🦁 SAFARI VISION",
     }.get(mode, "🦁 SAFARI")
 
-    lines = [title, "", f"📱 Платформа: {platform}", f"🕒 Дані: {timestamp}"]
+    freshness = clean_text(analysis.get("data_freshness"), "unconfirmed")
+    freshness_labels = {
+        "confirmed_current": "підтверджена",
+        "user_confirmed": "підтверджена користувачем",
+        "unconfirmed": "НЕ ПІДТВЕРДЖЕНА",
+        "stale": "ЗАСТАРІЛА",
+    }
+    lines = [
+        title,
+        "",
+        f"📱 Платформа: {platform}",
+        f"🕒 Дані: {timestamp}",
+        f"🧭 Актуальність: {freshness_labels.get(freshness, freshness)}",
+    ]
 
     for index, position in enumerate(positions, start=1):
         if not isinstance(position, dict):
@@ -1098,6 +1281,8 @@ def format_analysis(analysis: dict[str, Any]) -> str:
                 f"🏷️ Акція: {value_with_source(position.get('underlying_price'), 'money')}",
                 f"↔️ Bid / Ask: {value_with_source(position.get('bid'), 'money')} / "
                 f"{value_with_source(position.get('ask'), 'money')}",
+                f"📦 Bid size / Ask size: {value_with_source(position.get('bid_size'))} / "
+                f"{value_with_source(position.get('ask_size'))}",
                 f"📚 OI / Volume: {value_with_source(position.get('open_interest'))} / "
                 f"{value_with_source(position.get('volume'))}",
                 f"⚙️ Delta / Theta: {value_with_source(position.get('delta'))} / "
@@ -1255,7 +1440,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         else "⚠️ Пам’ять: тимчасова — потрібен Railway Volume"
     )
     await update.message.reply_text(
-        "🦁 SAFARI 1.4 CORE FIX на зв’язку.\n\n"
+        "🦁 SAFARI 1.4.1 DATA GUARD на зв’язку.\n\n"
         "Тільки читання, аналіз і рекомендації. Автоматичних угод немає.\n\n"
         "Команди:\n"
         "• надішли скріншот — VISION + TRADING/GUARDIAN\n"
@@ -1674,7 +1859,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
 
     logger.info(
-        "SAFARI 1.1 started | read_only=%s | webull_configured=%s | data_dir=%s",
+        "SAFARI 1.4.1 DATA GUARD started | read_only=%s | webull_configured=%s | data_dir=%s",
         READ_ONLY_MODE,
         bool(WEBULL_APP_KEY and WEBULL_APP_SECRET),
         DATA_DIR,

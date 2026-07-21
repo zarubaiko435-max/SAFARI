@@ -1,0 +1,14 @@
+SAFARI 1.4.1 DATA GUARD
+
+Lean safety fix only — no new trading module.
+
+Changes:
+- Does not treat the phone status-bar clock as market-data time.
+- Marks screenshot freshness as confirmed, user-confirmed, unconfirmed, or stale.
+- Blocks current HOLD/REDUCE/EXIT recommendations when freshness is unconfirmed/stale.
+- Requires a fresh screenshot captioned СВІЖИЙ/LIVE when no full in-app date is visible.
+- Separates Bid size / Ask size from Open Interest / Volume.
+- Keeps OI/Volume missing unless their labels are explicitly visible.
+- Does not save stale/unconfirmed screenshot positions into active GUARDIAN memory.
+- Preserves Webull read-only mode, Railway Volume memory, rate-limit safety, and all SAFARI 1.3/1.4 functions.
+- Corrects startup version label.

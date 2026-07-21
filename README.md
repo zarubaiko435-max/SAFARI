@@ -1,14 +1,24 @@
-# 🦁 SAFARI 1.4 CORE FIX
+# 🦁 SAFARI 1.4.1 DATA GUARD
 
-A minimal, practical upgrade over SAFARI 1.3 VERIFIED.
+A small safety patch for the existing read-only SAFARI Telegram trading assistant.
 
-## What changed
-- Calculates days to option expiration in code.
-- Flags 0–14 days as near expiration.
-- Estimates daily Theta exposure across all contracts.
-- Never treats expiry break-even as today's stop/invalidation.
-- Keeps WAIT/HOLD/REDUCE/EXIT advisory only; no trade execution.
-- Hides verbose HTTP request URLs from logs.
+## Purpose
+
+Prevent two specific screenshot-analysis errors:
+
+1. Old or undated screenshots being treated as current market data.
+2. Bid/Ask size being mislabeled as Open Interest/Volume.
+
+## Freshness rule
+
+- A full date visible inside the trading app can confirm freshness.
+- A phone status-bar clock cannot confirm freshness.
+- When no full in-app date is visible, caption a genuinely current screenshot with `СВІЖИЙ` or `LIVE`.
+- Without confirmation, SAFARI returns `WAIT` and does not save that screenshot as an active GUARDIAN position.
 
 ## Safety
-Read-only. No order placement, modification, cancellation, or execution calls.
+
+- READ ONLY.
+- No order placement, change, cancellation, or closing.
+- No automatic Webull retries.
+- Existing persistent memory under `/data` remains unchanged.
