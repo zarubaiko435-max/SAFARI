@@ -1,4 +1,4 @@
-"""SAFARI 1.4.1 DATA GUARD — freshness and label guardrails, read-only trading copilot.
+"""SAFARI 1.4.2 MERGE FIX — one-position memory merge, read-only trading copilot.
 
 Safety contract:
 - Reads screenshots and Webull account/position data.
@@ -534,7 +534,7 @@ webull_last_request_monotonic = 0.0
 # ---------------------------------------------------------------------------
 
 SCREENSHOT_ANALYSIS_PROMPT = r"""
-Ти — 🦁 SAFARI 1.4.1 DATA GUARD, read-only Trading Copilot.
+Ти — 🦁 SAFARI 1.4.2 MERGE FIX, read-only Trading Copilot.
 Ти НІКОЛИ не відкриваєш, не змінюєш і не закриваєш угоди. Лише читаєш,
 аналізуєш і даєш рекомендацію, остаточне рішення завжди за трейдером.
 
@@ -1103,12 +1103,99 @@ def value_with_source(field: Any, formatter: str = "text") -> str:
     return f"{rendered} ({label})"
 
 
+def _canonical_instrument(value: Any) -> str:
+    text = clean_text(value, "UNKNOWN").upper()
+    if "CALL" in text:
+        return "CALL"
+    if "PUT" in text:
+        return "PUT"
+    if "STOCK" in text or "SHARE" in text:
+        return "STOCK"
+    return text
+
+
+def _canonical_strike(value: Any) -> str:
+    number = safe_float(value)
+    if number is None:
+        return "-"
+    return f"{number:.4f}".rstrip("0").rstrip(".")
+
+
+def _canonical_expiration(value: Any) -> str:
+    parsed = parse_expiration_date(value)
+    if parsed is not None:
+        return parsed.date().isoformat()
+    raw = clean_text(value, "-").upper()
+    raw = re.sub(r"\([^)]*\)", "", raw)
+    return re.sub(r"\s+", " ", raw).strip() or "-"
+
+
 def position_key(position: dict[str, Any]) -> str:
+    """Stable identity for one position across API and screenshot formats."""
     ticker = clean_text(position.get("ticker"), "UNKNOWN").upper()
-    instrument = clean_text(position.get("instrument"), "UNKNOWN").upper()
-    strike = clean_text((position.get("strike") or {}).get("value"), "-")
-    expiration = clean_text((position.get("expiration") or {}).get("value"), "-")
+    instrument = _canonical_instrument(position.get("instrument"))
+    strike = _canonical_strike((position.get("strike") or {}).get("value"))
+    expiration = _canonical_expiration((position.get("expiration") or {}).get("value"))
     return f"{ticker}|{instrument}|{strike}|{expiration}"
+
+
+def _matching_position_keys(
+    position_store: dict[str, Any],
+    position: dict[str, Any],
+) -> list[str]:
+    target = position_key(position)
+    matches: list[str] = []
+    for stored_key, item in position_store.items():
+        if not isinstance(item, dict):
+            continue
+        stored_position = item.get("position")
+        if isinstance(stored_position, dict) and position_key(stored_position) == target:
+            matches.append(stored_key)
+    return matches
+
+
+def _field_is_present(field: Any) -> bool:
+    if not isinstance(field, dict):
+        return field not in (None, "")
+    source = clean_text(field.get("source"), "missing").lower()
+    value = field.get("value")
+    return source != "missing" and value not in (None, "")
+
+
+def _merge_position_fields(
+    existing: dict[str, Any],
+    fresh: dict[str, Any],
+) -> dict[str, Any]:
+    """Overlay visible fresh fields while retaining API identity when missing."""
+    merged = deepcopy(existing)
+    for name, value in fresh.items():
+        if name in {"ticker", "instrument"}:
+            if clean_text(value, ""):
+                merged[name] = value
+            continue
+        if name == "math_checks":
+            if isinstance(value, dict):
+                merged[name] = deepcopy(value)
+            continue
+        if _field_is_present(value):
+            merged[name] = deepcopy(value)
+        elif name not in merged:
+            merged[name] = deepcopy(value)
+    return merged
+
+
+def _preferred_existing_item(
+    position_store: dict[str, Any],
+    matching_keys: list[str],
+) -> dict[str, Any] | None:
+    candidates = [position_store.get(key) for key in matching_keys]
+    valid = [item for item in candidates if isinstance(item, dict)]
+    for item in valid:
+        if item.get("source") == "Webull OpenAPI":
+            return item
+    if not valid:
+        return None
+    return max(valid, key=lambda item: clean_text(item.get("updated_at_utc"), ""))
 
 
 def update_state_from_analysis(user_id: int, analysis: dict[str, Any]) -> None:
@@ -1127,18 +1214,52 @@ def update_state_from_analysis(user_id: int, analysis: dict[str, Any]) -> None:
         positions = analysis.get("positions")
         if isinstance(positions, list):
             position_store = user.setdefault("positions", {})
+            if not isinstance(position_store, dict):
+                position_store = {}
+                user["positions"] = position_store
             for position in positions:
                 if not isinstance(position, dict):
                     continue
-                key = position_key(position)
-                position_store[key] = {
-                    "position": position,
+
+                canonical_key = position_key(position)
+                matching_keys = _matching_position_keys(position_store, position)
+                preferred = _preferred_existing_item(position_store, matching_keys)
+
+                if preferred is not None:
+                    existing_position = preferred.get("position", {})
+                    merged_position = _merge_position_fields(
+                        existing_position if isinstance(existing_position, dict) else {},
+                        position,
+                    )
+                    source = (
+                        "Webull OpenAPI"
+                        if preferred.get("source") == "Webull OpenAPI"
+                        else "screenshot"
+                    )
+                else:
+                    merged_position = deepcopy(position)
+                    source = "screenshot"
+
+                # Collapse every legacy/API/screenshot key for the same contract.
+                for old_key in matching_keys:
+                    position_store.pop(old_key, None)
+
+                position_store[canonical_key] = {
+                    "position": merged_position,
                     "guardian": analysis.get("guardian", {}),
                     "hard_stops": analysis.get("hard_stops", []),
                     "data_quality": analysis.get("data_quality", "low"),
                     "updated_at_utc": utc_now(),
-                    "source": "screenshot",
+                    "source": source,
+                    "market_data_source": "fresh screenshot",
                 }
+                logger.info(
+                    "GUARDIAN_MEMORY merge key=%s collapsed=%s source=%s user=%s",
+                    canonical_key,
+                    len(matching_keys),
+                    source,
+                    user_id,
+                )
 
     state_store.update_user(user_id, user)
 
@@ -1186,6 +1307,13 @@ def update_state_from_webull(
             if not isinstance(position, dict):
                 continue
             key = position_key(position)
+
+            # A live API read is authoritative for position existence. Remove any
+            # screenshot/legacy copies of the same contract before saving it.
+            matching_keys = _matching_position_keys(position_store, position)
+            for old_key in matching_keys:
+                position_store.pop(old_key, None)
+
             position_store[key] = {
                 "position": position,
                 "guardian": analysis.get("guardian", {}),
@@ -1193,6 +1321,7 @@ def update_state_from_webull(
                 "data_quality": analysis.get("data_quality", "low"),
                 "updated_at_utc": clean_text(fetched_at_utc, utc_now()),
                 "source": "Webull OpenAPI",
+                "market_data_source": "Webull OpenAPI",
             }
 
     state_store.update_user(user_id, user)
@@ -1478,7 +1607,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         else "⚠️ Пам’ять: тимчасова — потрібен Railway Volume"
     )
     await update.message.reply_text(
-        "🦁 SAFARI 1.4.1 DATA GUARD на зв’язку.\n\n"
+        "🦁 SAFARI 1.4.2 MERGE FIX на зв’язку.\n\n"
         "Тільки читання, аналіз і рекомендації. Автоматичних угод немає.\n\n"
         "Команди:\n"
         "• надішли скріншот — VISION + TRADING/GUARDIAN\n"
@@ -1922,7 +2051,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
 
     logger.info(
-        "SAFARI 1.4.1 DATA GUARD started | read_only=%s | webull_configured=%s | data_dir=%s",
+        "SAFARI 1.4.2 MERGE FIX started | read_only=%s | webull_configured=%s | data_dir=%s",
         READ_ONLY_MODE,
         bool(WEBULL_APP_KEY and WEBULL_APP_SECRET),
         DATA_DIR,

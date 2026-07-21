@@ -1,17 +1,21 @@
-# 🦁 SAFARI 1.4.1 CLEANUP PATCH
+# 🦁 SAFARI 1.4.2 MERGE FIX
 
-A minimal maintenance patch for the existing read-only SAFARI 1.4.1 DATA GUARD deployment.
+A lean memory-correction patch for the read-only SAFARI GUARDIAN.
 
-## Changes
+## What it fixes
 
-- Fixes the screenshot-analysis start label to `SAFARI 1.4.1 DATA GUARD`.
-- Adds the Telegram command `ОЧИСТИТИ ДУБЛІ`.
-- That command removes only legacy positions whose source is `screenshot`.
-- Live positions whose source is `Webull OpenAPI` are preserved.
+- A fresh screenshot of an already saved Webull contract no longer creates a second position.
+- Position identity is normalized across formats, for example:
+  - `2026-07-31` and `31 Jul 26 (W)` are the same expiration.
+  - `17`, `17.0`, and `17.00` are the same strike.
+  - `CALL option` and `CALL` are the same instrument.
+- All legacy keys for the same contract are collapsed into one canonical record.
+- Webull remains the source of position existence; a fresh screenshot updates the latest visible market fields and GUARDIAN assessment.
+- A future live `WEBULL` read also removes matching screenshot duplicates automatically.
 
 ## Safety
 
 - READ ONLY.
 - No order placement, modification, cancellation, or closing.
-- Cleanup changes only local GUARDIAN memory under `/data`.
-- The command reports how many screenshot entries were removed and how many Webull positions were preserved.
+- Changes only local GUARDIAN memory under `/data`.
+- DATA GUARD, rate-limit safety, and persistent Railway Volume memory remain enabled.

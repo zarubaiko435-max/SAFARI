@@ -1,0 +1,12 @@
+SAFARI 1.4.2 MERGE FIX
+
+Lean functional fix only.
+
+Changes:
+- Adds canonical position identity by ticker, instrument, normalized strike, and normalized expiration.
+- Merges a user-confirmed fresh screenshot into the matching Webull position instead of appending a duplicate.
+- Collapses all legacy/screenshot/API records for the same contract into one record.
+- Preserves source=Webull OpenAPI when a screenshot enriches an existing live Webull position.
+- A live WEBULL refresh removes matching screenshot duplicates before saving API data.
+- Updates visible startup/version labels to SAFARI 1.4.2 MERGE FIX.
+- Preserves READ ONLY, DATA GUARD, Webull rate-limit safety, and Railway Volume memory.
