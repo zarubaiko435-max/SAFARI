@@ -1,4 +1,4 @@
-"""🦁 SAFARI 1.5.0 STABILITY CORE — deterministic ingress, read-only trading copilot."""
+"""🦁 SAFARI 1.6.0 SESSION JUDGE — multi-screenshot, read-only trading copilot."""
 
 from __future__ import annotations
 
@@ -20,16 +20,22 @@ from safari_core import (
     SAFARI_VERSION,
     JsonStateStore,
     PendingIntent,
+    append_trade_session_snapshot,
     build_analysis,
+    clear_trade_session,
+    confirm_trade_session,
+    ensure_trade_session,
     clean_text,
     format_analysis,
     format_dossier,
+    format_trade_session_result,
     format_local_positions,
     make_pending_intent,
     money,
     percentage,
     remove_screenshot_position_duplicates,
     route_envelope,
+    start_trade_session,
     startup_self_check,
     update_state_from_analysis,
     update_state_from_webull,
@@ -198,13 +204,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"🦁 SAFARI {SAFARI_VERSION} на зв’язку.\n\n"
         "Тільки читання, аналіз і рекомендації. Автоматичних угод немає.\n\n"
         "Основний цикл:\n"
-        "• ТРЕЙДИНГ TSLA CALL — задати ідею\n"
-        "• наступний скрін — перевірка саме цієї ідеї\n"
-        "• WEBULL — синхронізувати відкриті позиції\n"
-        "• МОЇ ПОЗИЦІЇ — локальна пам’ять\n"
-        "• ЧОМУ? — докази рішення\n"
-        "• ДОСЬЄ — завершені угоди\n"
-        "• СКАСУВАТИ — прибрати очікуваний скрін\n"
+        "• ТРЕЙДИНГ TSLA CALL — відкрити одну торгову сесію\n"
+        "• надішли option detail/chain, порівняльний бік і свіжий графік\n"
+        "• SAFARI об’єднує всі скріни в один Session Judge\n"
+        "• ЗАТВЕРДЖУЮ — зафіксувати фінальне рішення\n"
+        "• ЧОМУ? — повні факти та правила рішення\n"
+        "• СКАСУВАТИ — закрити сесію без рішення\n"
+        "• WEBULL / МОЇ ПОЗИЦІЇ / ДОСЬЄ — Guardian і журнал\n"
         "• СТАТУС — версія й стан\n\n"
         f"💾 Пам’ять: {storage}"
     )
@@ -219,12 +225,23 @@ async def status_command(update: Update) -> None:
         if pending
         else "немає очікуваного скріну"
     )
+    user = state_store.user(update.effective_user.id)
+    session = user.get("trade_session")
+    if isinstance(session, dict):
+        snapshots = session.get("snapshots")
+        count = len(snapshots) if isinstance(snapshots, list) else 0
+        last = session.get("last_result")
+        verdict = clean_text(last.get("verdict"), "WAIT") if isinstance(last, dict) else "ще немає"
+        session_line = f"{session.get('ticker')} {session.get('instrument')}, скрінів {count}, вердикт {verdict}"
+    else:
+        session_line = "немає"
     await update.message.reply_text(
         f"🦁 SAFARI STATUS\n\n"
         f"Версія: {SAFARI_VERSION}\n"
         f"Режим: READ ONLY ✅\n"
         f"Router: deterministic ✅\n"
         f"State: {pending_line}\n"
+        f"Session Judge: {session_line}\n"
         f"OpenAI model: {OPENAI_MODEL}\n"
         f"Webull: {'configured' if webull_reader and webull_reader.enabled else 'not configured'}"
     )
@@ -424,7 +441,19 @@ async def analyze_image_message(
                 "data_quality": analysis.get("data_quality"),
             },
         )
-        formatted = format_analysis(analysis)
+        if route_pending and route_pending.mode == "TRADING":
+            session_result = append_trade_session_snapshot(
+                state_store,
+                update.effective_user.id,
+                pending=route_pending,
+                extraction=extraction,
+                analysis=analysis,
+                caption=update.message.caption or "",
+                user_timezone=USER_TIMEZONE,
+            )
+            formatted = format_trade_session_result(session_result)
+        else:
+            formatted = format_analysis(analysis)
         if len(formatted) <= MAX_TELEGRAM_MESSAGE:
             await status.edit_text(formatted)
         else:
@@ -474,17 +503,20 @@ async def ingress_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         pending = explicit or stored_pending
         if explicit:
             state_store.set_pending(update.effective_user.id, explicit)
+            if explicit.mode == "TRADING":
+                ensure_trade_session(state_store, update.effective_user.id, explicit)
         await analyze_image_message(update, context, route_pending=pending)
         return
 
     if decision.route == "SET_TRADING_INTENT":
         pending = make_pending_intent("TRADING", decision.ticker, decision.instrument or "UNKNOWN")
-        state_store.set_pending(update.effective_user.id, pending)
+        start_trade_session(state_store, update.effective_user.id, pending)
         await update.message.reply_text(
-            "🎯 SAFARI TRADING — КОНТЕКСТ ЗБЕРЕЖЕНО ✅\n\n"
+            "🎯 SAFARI SESSION JUDGE — СЕСІЮ ВІДКРИТО ✅\n\n"
             f"Ідея: {pending.ticker} {pending.instrument}\n"
-            "Наступний скрін буде перевірено саме для цієї ідеї.\n\n"
-            "👉 Надішли option chain, де видно expiry, strike, Bid/Ask, OI, Volume, IV і Greeks."
+            "Усі наступні скріни об'єднуються в ОДНЕ рішення.\n"
+            "Окремий скрін більше не отримує самостійний вердикт.\n\n"
+            "👉 Спочатку надішли option detail/chain, потім свіжий графік 5m або 15m."
         )
         return
 
@@ -528,8 +560,20 @@ async def ingress_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
     if decision.route == "CANCEL_PENDING":
-        state_store.set_pending(update.effective_user.id, None)
-        await update.message.reply_text("🦁 SAFARI ROUTER\n\nОчікуваний скрін скасовано ✅")
+        clear_trade_session(state_store, update.effective_user.id)
+        await update.message.reply_text("🦁 SAFARI ROUTER\n\nОчікуваний скрін і торгова сесія скасовані ✅")
+        return
+    if decision.route == "CONFIRM_TRADE":
+        result = confirm_trade_session(state_store, update.effective_user.id)
+        if not result:
+            await update.message.reply_text(
+                "🎯 SAFARI SESSION JUDGE\n\nНемає готового рішення для затвердження."
+            )
+        else:
+            await update.message.reply_text(
+                format_trade_session_result(result)
+                + "\n\n🔒 Рішення зафіксовано. Жодної угоди бот не виконував."
+            )
         return
     if decision.route == "STATUS":
         await status_command(update)

@@ -90,6 +90,12 @@ EXTRACTION_INSTRUCTIONS = """
 10. ticker_header і underlying_price_header — тільки з видимого заголовка активу.
 11. conflicts — лише фактичні конфлікти між видимими даними, не припущення.
 12. evidence має бути коротким: назва видимого label/ділянки, без вигаданих пояснень.
+13. Для screen_type=chart заповнюй chart тільки явно видимими числовими фактами:
+   - timeframe — лише видимий 1m/5m/15m/1h/1D тощо;
+   - period_change_percent — лише якщо відсоток реально показаний;
+   - open/high/low/close — лише поруч із видимими O/H/L/C або повними labels;
+   - vwap — лише коли лінія/значення явно підписані VWAP.
+   Не вигадуй напрямок, support, resistance, breakout або свічковий патерн.
 """.strip()
 
 WEBULL_INSTRUCTIONS = """

@@ -1,0 +1,760 @@
+--- SAFARI_1_5_0/bot.py	2026-07-21 23:22:08.771651375 +0000
++++ SAFARI_1_6_0/bot.py	2026-07-21 23:55:30.247722953 +0000
+@@ -1,4 +1,4 @@
+-"""🦁 SAFARI 1.5.0 STABILITY CORE — deterministic ingress, read-only trading copilot."""
++"""🦁 SAFARI 1.6.0 SESSION JUDGE — multi-screenshot, read-only trading copilot."""
+ 
+ from __future__ import annotations
+ 
+@@ -20,16 +20,22 @@
+     SAFARI_VERSION,
+     JsonStateStore,
+     PendingIntent,
++    append_trade_session_snapshot,
+     build_analysis,
++    clear_trade_session,
++    confirm_trade_session,
++    ensure_trade_session,
+     clean_text,
+     format_analysis,
+     format_dossier,
++    format_trade_session_result,
+     format_local_positions,
+     make_pending_intent,
+     money,
+     percentage,
+     remove_screenshot_position_duplicates,
+     route_envelope,
++    start_trade_session,
+     startup_self_check,
+     update_state_from_analysis,
+     update_state_from_webull,
+@@ -198,13 +204,13 @@
+         f"🦁 SAFARI {SAFARI_VERSION} на зв’язку.\n\n"
+         "Тільки читання, аналіз і рекомендації. Автоматичних угод немає.\n\n"
+         "Основний цикл:\n"
+-        "• ТРЕЙДИНГ TSLA CALL — задати ідею\n"
+-        "• наступний скрін — перевірка саме цієї ідеї\n"
+-        "• WEBULL — синхронізувати відкриті позиції\n"
+-        "• МОЇ ПОЗИЦІЇ — локальна пам’ять\n"
+-        "• ЧОМУ? — докази рішення\n"
+-        "• ДОСЬЄ — завершені угоди\n"
+-        "• СКАСУВАТИ — прибрати очікуваний скрін\n"
++        "• ТРЕЙДИНГ TSLA CALL — відкрити одну торгову сесію\n"
++        "• надішли option detail/chain, порівняльний бік і свіжий графік\n"
++        "• SAFARI об’єднує всі скріни в один Session Judge\n"
++        "• ЗАТВЕРДЖУЮ — зафіксувати фінальне рішення\n"
++        "• ЧОМУ? — повні факти та правила рішення\n"
++        "• СКАСУВАТИ — закрити сесію без рішення\n"
++        "• WEBULL / МОЇ ПОЗИЦІЇ / ДОСЬЄ — Guardian і журнал\n"
+         "• СТАТУС — версія й стан\n\n"
+         f"💾 Пам’ять: {storage}"
+     )
+@@ -219,12 +225,23 @@
+         if pending
+         else "немає очікуваного скріну"
+     )
++    user = state_store.user(update.effective_user.id)
++    session = user.get("trade_session")
++    if isinstance(session, dict):
++        snapshots = session.get("snapshots")
++        count = len(snapshots) if isinstance(snapshots, list) else 0
++        last = session.get("last_result")
++        verdict = clean_text(last.get("verdict"), "WAIT") if isinstance(last, dict) else "ще немає"
++        session_line = f"{session.get('ticker')} {session.get('instrument')}, скрінів {count}, вердикт {verdict}"
++    else:
++        session_line = "немає"
+     await update.message.reply_text(
+         f"🦁 SAFARI STATUS\n\n"
+         f"Версія: {SAFARI_VERSION}\n"
+         f"Режим: READ ONLY ✅\n"
+         f"Router: deterministic ✅\n"
+         f"State: {pending_line}\n"
++        f"Session Judge: {session_line}\n"
+         f"OpenAI model: {OPENAI_MODEL}\n"
+         f"Webull: {'configured' if webull_reader and webull_reader.enabled else 'not configured'}"
+     )
+@@ -424,7 +441,19 @@
+                 "data_quality": analysis.get("data_quality"),
+             },
+         )
+-        formatted = format_analysis(analysis)
++        if route_pending and route_pending.mode == "TRADING":
++            session_result = append_trade_session_snapshot(
++                state_store,
++                update.effective_user.id,
++                pending=route_pending,
++                extraction=extraction,
++                analysis=analysis,
++                caption=update.message.caption or "",
++                user_timezone=USER_TIMEZONE,
++            )
++            formatted = format_trade_session_result(session_result)
++        else:
++            formatted = format_analysis(analysis)
+         if len(formatted) <= MAX_TELEGRAM_MESSAGE:
+             await status.edit_text(formatted)
+         else:
+@@ -474,17 +503,20 @@
+         pending = explicit or stored_pending
+         if explicit:
+             state_store.set_pending(update.effective_user.id, explicit)
++            if explicit.mode == "TRADING":
++                ensure_trade_session(state_store, update.effective_user.id, explicit)
+         await analyze_image_message(update, context, route_pending=pending)
+         return
+ 
+     if decision.route == "SET_TRADING_INTENT":
+         pending = make_pending_intent("TRADING", decision.ticker, decision.instrument or "UNKNOWN")
+-        state_store.set_pending(update.effective_user.id, pending)
++        start_trade_session(state_store, update.effective_user.id, pending)
+         await update.message.reply_text(
+-            "🎯 SAFARI TRADING — КОНТЕКСТ ЗБЕРЕЖЕНО ✅\n\n"
++            "🎯 SAFARI SESSION JUDGE — СЕСІЮ ВІДКРИТО ✅\n\n"
+             f"Ідея: {pending.ticker} {pending.instrument}\n"
+-            "Наступний скрін буде перевірено саме для цієї ідеї.\n\n"
+-            "👉 Надішли option chain, де видно expiry, strike, Bid/Ask, OI, Volume, IV і Greeks."
++            "Усі наступні скріни об'єднуються в ОДНЕ рішення.\n"
++            "Окремий скрін більше не отримує самостійний вердикт.\n\n"
++            "👉 Спочатку надішли option detail/chain, потім свіжий графік 5m або 15m."
+         )
+         return
+ 
+@@ -528,8 +560,20 @@
+         )
+         return
+     if decision.route == "CANCEL_PENDING":
+-        state_store.set_pending(update.effective_user.id, None)
+-        await update.message.reply_text("🦁 SAFARI ROUTER\n\nОчікуваний скрін скасовано ✅")
++        clear_trade_session(state_store, update.effective_user.id)
++        await update.message.reply_text("🦁 SAFARI ROUTER\n\nОчікуваний скрін і торгова сесія скасовані ✅")
++        return
++    if decision.route == "CONFIRM_TRADE":
++        result = confirm_trade_session(state_store, update.effective_user.id)
++        if not result:
++            await update.message.reply_text(
++                "🎯 SAFARI SESSION JUDGE\n\nНемає готового рішення для затвердження."
++            )
++        else:
++            await update.message.reply_text(
++                format_trade_session_result(result)
++                + "\n\n🔒 Рішення зафіксовано. Жодної угоди бот не виконував."
++            )
+         return
+     if decision.route == "STATUS":
+         await status_command(update)
+--- SAFARI_1_5_0/safari_core.py	2026-07-21 23:21:54.363650860 +0000
++++ SAFARI_1_6_0/safari_core.py	2026-07-21 23:55:30.247722953 +0000
+@@ -21,8 +21,8 @@
+ 
+ from pydantic import BaseModel, ConfigDict, Field, field_validator
+ 
+-SAFARI_VERSION = "1.5.0 STABILITY CORE"
+-STATE_SCHEMA_VERSION = 2
++SAFARI_VERSION = "1.6.0 SESSION JUDGE"
++STATE_SCHEMA_VERSION = 3
+ READ_ONLY_MODE = True
+ 
+ Mode = Literal["GUARDIAN", "TRADING", "UNKNOWN"]
+@@ -35,6 +35,7 @@
+     "stock_order_ticket",
+     "account",
+     "screen_header",
++    "chart",
+     "unknown",
+ ]
+ ScreenType = Literal[
+@@ -95,6 +96,9 @@
+     "status": "STATUS",
+     "самотест": "SELFTEST",
+     "selftest": "SELFTEST",
++    "затверджую": "CONFIRM_TRADE",
++    "підтверджую": "CONFIRM_TRADE",
++    "confirm": "CONFIRM_TRADE",
+ }
+ 
+ WEBULL_IDENTITY_FIELDS = {"strike", "expiration", "quantity", "entry_price", "total_cost"}
+@@ -207,6 +211,20 @@
+     side: str | None = None
+ 
+ 
++class ChartExtraction(BaseModel):
++    """Only explicitly visible chart facts; never inferred support/resistance."""
++
++    model_config = ConfigDict(extra="forbid")
++
++    timeframe: ExtractedField = Field(default_factory=lambda: ExtractedField(scope="chart"))
++    period_change_percent: ExtractedField = Field(default_factory=lambda: ExtractedField(scope="chart"))
++    open_price: ExtractedField = Field(default_factory=lambda: ExtractedField(scope="chart"))
++    high_price: ExtractedField = Field(default_factory=lambda: ExtractedField(scope="chart"))
++    low_price: ExtractedField = Field(default_factory=lambda: ExtractedField(scope="chart"))
++    close_price: ExtractedField = Field(default_factory=lambda: ExtractedField(scope="chart"))
++    vwap: ExtractedField = Field(default_factory=lambda: ExtractedField(scope="chart"))
++
++
+ class ScreenshotExtraction(BaseModel):
+     model_config = ConfigDict(extra="forbid")
+ 
+@@ -220,6 +238,7 @@
+     option_rows: list[OptionRow] = Field(default_factory=list)
+     positions: list[PositionExtraction] = Field(default_factory=list)
+     order_ticket: OrderTicketExtraction | None = None
++    chart: ChartExtraction = Field(default_factory=ChartExtraction)
+     conflicts: list[str] = Field(default_factory=list)
+     extraction_notes: list[str] = Field(default_factory=list)
+ 
+@@ -1122,6 +1141,377 @@
+ 
+ 
+ # ---------------------------------------------------------------------------
++# Multi-screenshot TRADING session judge
++# ---------------------------------------------------------------------------
++
++
++def _session_reference_date(now: datetime, user_timezone: str) -> date:
++    try:
++        return now.astimezone(ZoneInfo(user_timezone)).date()
++    except Exception:
++        return now.date()
++
++
++def _snapshot_extraction(snapshot: dict[str, Any]) -> ScreenshotExtraction | None:
++    raw = snapshot.get("extraction")
++    if not isinstance(raw, dict):
++        return None
++    try:
++        return ScreenshotExtraction.model_validate(raw)
++    except Exception:
++        return None
++
++
++def _visible_tickers(extraction: ScreenshotExtraction) -> set[str]:
++    tickers = {
++        clean_text(extraction.ticker_header.value, "").upper(),
++        *{clean_text(row.ticker, "").upper() for row in extraction.option_rows},
++        *{clean_text(position.ticker, "").upper() for position in extraction.positions},
++    }
++    tickers.discard("")
++    return tickers
++
++
++def _chart_direction(chart: ChartExtraction) -> tuple[str, str]:
++    """Return UP/DOWN/SIDEWAYS/UNKNOWN using only visible numeric facts."""
++    change = safe_float(chart.period_change_percent.value)
++    evidence = ""
++    if change is not None:
++        evidence = f"видима зміна {change:+.2f}%"
++    else:
++        open_price = safe_float(chart.open_price.value)
++        close_price = safe_float(chart.close_price.value)
++        if open_price and close_price is not None:
++            change = (close_price - open_price) / open_price * 100
++            evidence = f"видимі Open/Close дають {change:+.2f}%"
++
++    if change is None:
++        return "UNKNOWN", "На графіку немає надійної числової зміни або Open/Close."
++    if change >= 0.25:
++        return "UP", evidence
++    if change <= -0.25:
++        return "DOWN", evidence
++    return "SIDEWAYS", evidence
++
++
++def _option_row_completeness(row: OptionRow) -> int:
++    fields = [
++        row.strike,
++        row.expiration,
++        row.bid,
++        row.ask,
++        row.open_interest if row.open_interest.label_visible else ExtractedField(),
++        row.volume if row.volume.label_visible else ExtractedField(),
++        row.iv,
++        row.delta,
++        row.theta,
++    ]
++    return sum(1 for field in fields if field_present(field))
++
++
++def _session_score_bar(value: Any) -> str:
++    score = safe_float(value)
++    normalized = max(0, min(5, int(round(score or 0))))
++    return "■" * normalized + "□" * (5 - normalized)
++
++
++def judge_trade_session(
++    session: dict[str, Any],
++    *,
++    now: datetime | None = None,
++    user_timezone: str = "America/Los_Angeles",
++) -> dict[str, Any]:
++    """Judge all screenshots in one idea as a single deterministic evidence set."""
++    now = now or datetime.now(timezone.utc)
++    reference = _session_reference_date(now, user_timezone)
++    ticker = clean_text(session.get("ticker"), "").upper()
++    instrument = clean_text(session.get("instrument"), "UNKNOWN").upper()
++    if instrument not in {"CALL", "PUT"}:
++        instrument = "UNKNOWN"
++
++    snapshots = session.get("snapshots")
++    if not isinstance(snapshots, list):
++        snapshots = []
++
++    contract_versions: dict[str, tuple[int, OptionRow, dict[str, Any], ScreenshotExtraction]] = {}
++    opposite_contracts = 0
++    chart_candidates: list[tuple[int, dict[str, Any], ScreenshotExtraction]] = []
++    ticker_conflicts: list[str] = []
++
++    for index, snapshot in enumerate(snapshots):
++        if not isinstance(snapshot, dict):
++            continue
++        extraction = _snapshot_extraction(snapshot)
++        if extraction is None:
++            continue
++        visible_tickers = _visible_tickers(extraction)
++        if ticker and visible_tickers and ticker not in visible_tickers:
++            ticker_conflicts.append(
++                f"Скрін #{index + 1}: очікується {ticker}, видно {', '.join(sorted(visible_tickers))}."
++            )
++            continue
++        if extraction.screen_type == "chart":
++            chart_candidates.append((index, snapshot, extraction))
++        for row in extraction.option_rows:
++            row_ticker = clean_text(row.ticker, "").upper() or clean_text(
++                extraction.ticker_header.value, ""
++            ).upper()
++            if ticker and row_ticker and row_ticker != ticker:
++                continue
++            if row.instrument != instrument:
++                if row.instrument in {"CALL", "PUT"}:
++                    opposite_contracts += 1
++                continue
++            if not row.ticker and ticker:
++                row = row.model_copy(update={"ticker": ticker})
++            key = (
++                f"{row.instrument}|{canonical_strike(row.strike.value)}|"
++                f"{canonical_expiration(row.expiration.value, reference=reference)}"
++            )
++            contract_versions[key] = (index, row, snapshot, extraction)
++
++    selected_tuple: tuple[int, OptionRow, dict[str, Any], ScreenshotExtraction] | None = None
++    if contract_versions:
++        versions = list(contract_versions.values())
++        preferred, _ = select_option_candidate([item[1] for item in versions], instrument, reference=reference)
++        if preferred is not None:
++            selected_tuple = next((item for item in versions if item[1] is preferred), None)
++        if selected_tuple is None:
++            selected_tuple = max(
++                versions,
++                key=lambda item: (_option_row_completeness(item[1]), item[0]),
++            )
++
++    latest_chart = max(chart_candidates, key=lambda item: item[0]) if chart_candidates else None
++    chart_direction = "UNKNOWN"
++    chart_evidence = "Графік не надіслано."
++    chart_freshness = "unconfirmed"
++    if latest_chart:
++        _, chart_snapshot, chart_extraction = latest_chart
++        chart_direction, chart_evidence = _chart_direction(chart_extraction.chart)
++        chart_analysis = chart_snapshot.get("analysis")
++        if isinstance(chart_analysis, dict):
++            chart_freshness = clean_text(chart_analysis.get("data_freshness"), "unconfirmed")
++
++    hard_stops: list[dict[str, str]] = []
++    missing: list[str] = []
++    dte: int | None = None
++    spread_pct: float | None = None
++    strike_text = "—"
++    expiration_text = "—"
++    premium_text = "—"
++    selected_freshness = "unconfirmed"
++    selected_quality = "low"
++    selected_row: OptionRow | None = None
++
++    if selected_tuple:
++        _, selected_row, selected_snapshot, selected_extraction = selected_tuple
++        selected_analysis = selected_snapshot.get("analysis")
++        if isinstance(selected_analysis, dict):
++            selected_freshness = clean_text(selected_analysis.get("data_freshness"), "unconfirmed")
++            selected_quality = clean_text(selected_analysis.get("data_quality"), "low")
++        spread_stop, spread_pct = spread_policy(selected_row.bid.value, selected_row.ask.value)
++        liquidity_stop = liquidity_policy(selected_row.open_interest, selected_row.volume)
++        expiration_stop, dte = expiration_policy(selected_row.expiration.value, reference=reference)
++        earnings_stop = earnings_policy(selected_extraction.earnings_date, dte, reference=reference)
++        freshness_stop = stop(
++            "stale_data",
++            "clear" if selected_freshness in {"confirmed_current", "user_confirmed"} else "triggered",
++            "Контракт підтверджено як актуальний."
++            if selected_freshness in {"confirmed_current", "user_confirmed"}
++            else "Актуальність контракту не підтверджена.",
++        )
++        conflict_stop = stop(
++            "conflicting_data",
++            "triggered" if ticker_conflicts else "clear",
++            "; ".join(ticker_conflicts) if ticker_conflicts else "Тикер у сесії узгоджений.",
++        )
++        hard_stops = [
++            spread_stop,
++            liquidity_stop,
++            expiration_stop,
++            earnings_stop,
++            freshness_stop,
++            conflict_stop,
++        ]
++        strike_number = safe_float(selected_row.strike.value)
++        strike_text = money(strike_number, clean_text(selected_row.strike.value, "—"))
++        expiration_text = canonical_expiration(selected_row.expiration.value, reference=reference)
++        bid_n, ask_n = safe_float(selected_row.bid.value), safe_float(selected_row.ask.value)
++        if bid_n is not None and ask_n is not None:
++            mid = (bid_n + ask_n) / 2
++            premium_text = f"${bid_n:.2f}–${ask_n:.2f} (mid ${mid:.2f})"
++        for name, field in (
++            ("strike", selected_row.strike),
++            ("expiration", selected_row.expiration),
++            ("bid", selected_row.bid),
++            ("ask", selected_row.ask),
++            ("open_interest", selected_row.open_interest if selected_row.open_interest.label_visible else ExtractedField()),
++            ("volume", selected_row.volume if selected_row.volume.label_visible else ExtractedField()),
++            ("iv", selected_row.iv),
++            ("delta", selected_row.delta),
++            ("theta", selected_row.theta),
++        ):
++            if not field_present(field):
++                missing.append(name)
++    else:
++        hard_stops = [
++            stop("wide_spread", "not_checked", "Немає контракту потрібного напрямку."),
++            stop("low_liquidity", "not_checked", "Немає контракту потрібного напрямку."),
++            stop("near_expiration", "not_checked", "Немає контракту потрібного напрямку."),
++            stop("earnings_risk", "not_checked", "Немає контракту потрібного напрямку."),
++            stop(
++                "conflicting_data",
++                "triggered" if ticker_conflicts else "clear",
++                "; ".join(ticker_conflicts) if ticker_conflicts else "Тикер у сесії узгоджений.",
++            ),
++        ]
++        missing.append(f"контракт {instrument}")
++
++    direction_matches = (instrument == "CALL" and chart_direction == "UP") or (
++        instrument == "PUT" and chart_direction == "DOWN"
++    )
++    direction_opposes = (instrument == "CALL" and chart_direction == "DOWN") or (
++        instrument == "PUT" and chart_direction == "UP"
++    )
++
++    stop_by_name = {item["name"]: item for item in hard_stops}
++    spread_clear = stop_by_name.get("wide_spread", {}).get("status") == "clear"
++    liquidity_clear = stop_by_name.get("low_liquidity", {}).get("status") == "clear"
++    expiration_clear = stop_by_name.get("near_expiration", {}).get("status") == "clear"
++    contract_current = selected_freshness in {"confirmed_current", "user_confirmed"}
++    chart_current = chart_freshness in {"confirmed_current", "user_confirmed"}
++
++    strength_score = sum(
++        [
++            1 if selected_row is not None and not missing else 0,
++            1 if spread_clear else 0,
++            1 if liquidity_clear else 0,
++            1 if expiration_clear else 0,
++            1 if direction_matches and chart_current else 0,
++        ]
++    )
++    risk_score = 1
++    if dte is not None and dte <= 3:
++        risk_score += 2
++    elif dte is not None and dte <= 14:
++        risk_score += 1
++    if stop_by_name.get("wide_spread", {}).get("status") == "triggered":
++        risk_score += 1
++    if stop_by_name.get("low_liquidity", {}).get("status") == "triggered":
++        risk_score += 1
++    if direction_opposes:
++        risk_score += 2
++    elif chart_direction in {"UNKNOWN", "SIDEWAYS"}:
++        risk_score += 1
++    if not contract_current:
++        risk_score += 1
++    risk_score = max(0, min(5, risk_score))
++
++    severe_stops = [
++        item
++        for item in hard_stops
++        if item["status"] == "triggered"
++        and item["name"] in {
++            "wide_spread",
++            "low_liquidity",
++            "near_expiration",
++            "earnings_risk",
++        }
++    ]
++
++    if ticker_conflicts:
++        verdict = "WAIT"
++        action = "Надішли скрін саме поточного тикера; дані різних угод не змішуються."
++    elif selected_row is None:
++        verdict = "WAIT"
++        if opposite_contracts:
++            action = f"Є лише порівняльний бік. Надішли {ticker} {instrument} option detail/chain."
++        else:
++            action = f"Надішли {ticker} {instrument} option detail/chain з Bid/Ask, OI, Volume, IV і Greeks."
++    elif not contract_current:
++        verdict = "WAIT"
++        action = "Надішли актуальний контракт із підписом СВІЖИЙ або повною датою в застосунку."
++    elif severe_stops:
++        verdict = "PASS"
++        action = "Пропусти контракт: спрацював hard-stop."
++    elif latest_chart is None:
++        verdict = "WAIT"
++        action = f"Надішли свіжий графік {ticker} 5m або 15m для підтвердження напрямку."
++    elif not chart_current:
++        verdict = "WAIT"
++        action = "Надішли свіжий графік із підписом СВІЖИЙ або повною датою в застосунку."
++    elif direction_opposes:
++        verdict = "PASS"
++        action = f"Пропусти {instrument}: видимий рух графіка підтверджує протилежний напрямок."
++    elif chart_direction in {"UNKNOWN", "SIDEWAYS"}:
++        verdict = "WAIT"
++        action = "Напрямок не підтверджений; чекай чіткого руху й надішли оновлений графік."
++    elif missing or not (spread_clear and liquidity_clear and expiration_clear):
++        verdict = "WAIT"
++        action = "Додай відсутні дані контракту; рішення без повної перевірки не видається."
++    else:
++        verdict = "TAKE"
++        action = "Умови підтверджені; перевір розмір ризику та самостійно затвердь рішення."
++
++    stop_text = "; ".join(
++        f"{item['name']}={item['status']} ({item['evidence']})" for item in hard_stops
++    )
++    missing_text = "; ".join(missing) if missing else "немає"
++    why_full = (
++        f"ВИДИМІ ФАКТИ: сесія {ticker} {instrument}; скрінів {len(snapshots)}; "
++        f"контракт {strike_text} {expiration_text}, премія {premium_text}; "
++        f"графік {chart_direction} — {chart_evidence}. "
++        f"СТОП-ФІЛЬТРИ: {stop_text}. "
++        f"ВІДСУТНІ ДАНІ: {missing_text}. "
++        f"ВИСНОВОК: {verdict}. {action}"
++    )
++    why_short = (
++        f"Контракт {'є' if selected_row else 'не знайдено'}, графік {chart_direction}; "
++        f"сила {strength_score}/5, ризик {risk_score}/5."
++    )
++
++    return {
++        "mode": "TRADING_SESSION",
++        "ticker": ticker or None,
++        "instrument": instrument,
++        "strike": strike_text,
++        "expiration": expiration_text,
++        "premium": premium_text,
++        "strength_score": strength_score,
++        "risk_score": risk_score,
++        "verdict": verdict,
++        "one_action": action,
++        "why_short": why_short,
++        "why_full": why_full,
++        "hard_stops": hard_stops,
++        "missing_critical_data": missing,
++        "screens_received": len(snapshots),
++        "opposite_contracts_seen": opposite_contracts,
++        "chart_direction": chart_direction,
++        "chart_evidence": chart_evidence,
++        "data_quality": selected_quality,
++        "days_to_expiration": dte,
++        "spread_percent": spread_pct,
++    }
++
++
++def format_trade_session_result(result: dict[str, Any]) -> str:
++    verdict = clean_text(result.get("verdict"), "WAIT").upper()
++    icon = {"TAKE": "✅", "PASS": "❌", "WAIT": "⏸"}.get(verdict, "⏸")
++    return "\n".join(
++        [
++            f"🎯 Страйк: {clean_text(result.get('strike'), '—')}",
++            f"📅 Експірація: {clean_text(result.get('expiration'), '—')}",
++            f"💰 Премія: {clean_text(result.get('premium'), '—')}",
++            f"💪 Сила: {_session_score_bar(result.get('strength_score'))} {int(safe_float(result.get('strength_score')) or 0)}/5",
++            f"⚠️ Ризик: {_session_score_bar(result.get('risk_score'))} {int(safe_float(result.get('risk_score')) or 0)}/5",
++            f"{icon} Вердикт: {verdict} — {clean_text(result.get('one_action'), 'Чекати.')}",
++        ]
++    )
++
++
++# ---------------------------------------------------------------------------
+ # Position memory and persistence
+ # ---------------------------------------------------------------------------
+ 
+@@ -1202,6 +1592,8 @@
+             user.setdefault("last_analysis", None)
+             user.setdefault("last_full_reason", "")
+             user.setdefault("pending_intent", None)
++            user.setdefault("trade_session", None)
++            user.setdefault("confirmed_trade_ideas", [])
+             user.setdefault("audit_events", [])
+             for item in user.get("positions", {}).values() if isinstance(user.get("positions"), dict) else []:
+                 if not isinstance(item, dict) or item.get("source") != "Webull OpenAPI":
+@@ -1242,6 +1634,8 @@
+                     "last_analysis": None,
+                     "last_full_reason": "",
+                     "pending_intent": None,
++                    "trade_session": None,
++                    "confirmed_trade_ideas": [],
+                     "audit_events": [],
+                 },
+             )
+@@ -1278,6 +1672,119 @@
+         self.update_user(user_id, user)
+ 
+ 
++def start_trade_session(store: JsonStateStore, user_id: int, pending: PendingIntent) -> dict[str, Any]:
++    if pending.mode != "TRADING":
++        raise ValueError("Trade session requires TRADING pending intent")
++    session = {
++        "session_id": f"{pending.ticker or 'UNKNOWN'}-{pending.instrument}-{pending.created_at_utc}",
++        "ticker": (pending.ticker or "").upper(),
++        "instrument": pending.instrument,
++        "started_at_utc": pending.created_at_utc,
++        "expires_at_utc": pending.expires_at_utc,
++        "status": "collecting",
++        "snapshots": [],
++        "last_result": None,
++    }
++    user = store.user(user_id)
++    user["pending_intent"] = asdict(pending)
++    user["trade_session"] = session
++    store.update_user(user_id, user)
++    return deepcopy(session)
++
++
++def ensure_trade_session(store: JsonStateStore, user_id: int, pending: PendingIntent) -> dict[str, Any]:
++    user = store.user(user_id)
++    raw = user.get("trade_session")
++    if isinstance(raw, dict):
++        same = (
++            clean_text(raw.get("ticker"), "").upper() == clean_text(pending.ticker, "").upper()
++            and clean_text(raw.get("instrument"), "UNKNOWN").upper() == pending.instrument
++            and clean_text(raw.get("status"), "collecting") == "collecting"
++        )
++        if same:
++            return deepcopy(raw)
++    return start_trade_session(store, user_id, pending)
++
++
++def clear_trade_session(store: JsonStateStore, user_id: int) -> None:
++    user = store.user(user_id)
++    user["trade_session"] = None
++    user["pending_intent"] = None
++    store.update_user(user_id, user)
++
++
++def append_trade_session_snapshot(
++    store: JsonStateStore,
++    user_id: int,
++    *,
++    pending: PendingIntent,
++    extraction: ScreenshotExtraction,
++    analysis: dict[str, Any],
++    caption: str = "",
++    now: datetime | None = None,
++    user_timezone: str = "America/Los_Angeles",
++) -> dict[str, Any]:
++    now = now or datetime.now(timezone.utc)
++    session = ensure_trade_session(store, user_id, pending)
++    snapshots = session.setdefault("snapshots", [])
++    if not isinstance(snapshots, list):
++        snapshots = []
++        session["snapshots"] = snapshots
++    snapshots.append(
++        {
++            "received_at_utc": now.isoformat(timespec="seconds"),
++            "caption": caption,
++            "screen_type": extraction.screen_type,
++            "extraction": extraction.model_dump(),
++            "analysis": deepcopy(analysis),
++        }
++    )
++    # Keep enough context for CALL/PUT/graph comparisons without preserving stale clutter.
++    session["snapshots"] = snapshots[-10:]
++    session["updated_at_utc"] = now.isoformat(timespec="seconds")
++    result = judge_trade_session(session, now=now, user_timezone=user_timezone)
++    session["last_result"] = deepcopy(result)
++
++    user = store.user(user_id)
++    user["trade_session"] = session
++    user["last_analysis"] = deepcopy(result)
++    user["last_full_reason"] = clean_text(result.get("why_full"), "")
++    # A TRADING session remains open for more screenshots until CANCEL or CONFIRM.
++    user["pending_intent"] = asdict(pending)
++    store.update_user(user_id, user)
++    return result
++
++
++def confirm_trade_session(store: JsonStateStore, user_id: int) -> dict[str, Any] | None:
++    user = store.user(user_id)
++    session = user.get("trade_session")
++    if not isinstance(session, dict):
++        return None
++    result = session.get("last_result")
++    if not isinstance(result, dict):
++        return None
++    confirmed = {
++        "confirmed_at_utc": utc_now(),
++        "session_id": session.get("session_id"),
++        "ticker": session.get("ticker"),
++        "instrument": session.get("instrument"),
++        "result": deepcopy(result),
++    }
++    ideas = user.setdefault("confirmed_trade_ideas", [])
++    if not isinstance(ideas, list):
++        ideas = []
++        user["confirmed_trade_ideas"] = ideas
++    ideas.append(confirmed)
++    del ideas[:-20]
++    session["status"] = "confirmed"
++    session["confirmed_at_utc"] = confirmed["confirmed_at_utc"]
++    user["trade_session"] = session
++    user["pending_intent"] = None
++    store.update_user(user_id, user)
++    return deepcopy(result)
++
++
++
+ def update_state_from_analysis(store: JsonStateStore, user_id: int, analysis: dict[str, Any]) -> None:
+     user = store.user(user_id)
+     user["last_analysis"] = deepcopy(analysis)
+@@ -1327,7 +1834,12 @@
+                 "market_data_source": "fresh screenshot",
+             }
+ 
+-    user["pending_intent"] = None if mode in {"TRADING", "GUARDIAN"} and analysis.get("data_quality") == "high" else user.get("pending_intent")
++    # GUARDIAN is a one-screen refresh. TRADING stays open for multi-screen SESSION JUDGE.
++    user["pending_intent"] = (
++        None
++        if mode == "GUARDIAN" and analysis.get("data_quality") == "high"
++        else user.get("pending_intent")
++    )
+     store.update_user(user_id, user)
+ 
+ 
+@@ -1583,6 +2095,9 @@
+     decision = route_envelope(text=None, caption="ТРЕЙДИНГ TSLA PUT СВІЖИЙ", has_photo=True, has_image_document=False, pending=None)
+     if decision.route != "ANALYZE_IMAGE" or decision.ticker != "TSLA":
+         failures.append("photo caption routing")
++    decision = route_envelope(text="ЗАТВЕРДЖУЮ", caption=None, has_photo=False, has_image_document=False, pending=None)
++    if decision.route != "CONFIRM_TRADE":
++        failures.append("trade confirmation routing")
+     if canonical_expiration("31 Jul 26") != "2026-07-31":
+         failures.append("expiration normalization")
+     if safe_float("7/24") is not None:
+--- SAFARI_1_5_0/safari_ai.py	2026-07-21 23:21:56.087650921 +0000
++++ SAFARI_1_6_0/safari_ai.py	2026-07-21 23:27:05.947662003 +0000
+@@ -90,6 +90,12 @@
+ 10. ticker_header і underlying_price_header — тільки з видимого заголовка активу.
+ 11. conflicts — лише фактичні конфлікти між видимими даними, не припущення.
+ 12. evidence має бути коротким: назва видимого label/ділянки, без вигаданих пояснень.
++13. Для screen_type=chart заповнюй chart тільки явно видимими числовими фактами:
++   - timeframe — лише видимий 1m/5m/15m/1h/1D тощо;
++   - period_change_percent — лише якщо відсоток реально показаний;
++   - open/high/low/close — лише поруч із видимими O/H/L/C або повними labels;
++   - vwap — лише коли лінія/значення явно підписані VWAP.
++   Не вигадуй напрямок, support, resistance, breakout або свічковий патерн.
+ """.strip()
+ 
+ WEBULL_INSTRUCTIONS = """
