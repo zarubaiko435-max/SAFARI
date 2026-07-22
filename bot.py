@@ -1,4 +1,4 @@
-"""🦁 SAFARI 1.6.1 SESSION FLOW — multi-screenshot, read-only trading copilot."""
+"""🦁 SAFARI 1.7.0 AUTO JUDGE — one-command, read-only trading copilot."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from safari_ai import SafariAI
+from safari_autojudge import TradeIdea, autojudge_self_check, build_auto_decision, parse_auto_trade_command
 from safari_core import (
     READ_ONLY_MODE,
     SAFARI_VERSION,
@@ -36,7 +37,6 @@ from safari_core import (
     percentage,
     remove_screenshot_position_duplicates,
     route_envelope,
-    start_trade_session,
     startup_self_check,
     update_state_from_analysis,
     update_state_from_webull,
@@ -203,16 +203,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     storage = "постійна ✅" if PERSISTENT_STORAGE else "тимчасова — потрібен Railway Volume"
     await update.message.reply_text(
         f"🦁 SAFARI {SAFARI_VERSION} на зв’язку.\n\n"
-        "Тільки читання, аналіз і рекомендації. Автоматичних угод немає.\n\n"
-        "Основний цикл:\n"
-        "• ТРЕЙДИНГ TSLA CALL — відкрити одну торгову сесію\n"
-        "• надішли option detail/chain, порівняльний бік і свіжий графік\n"
-        "• SAFARI об’єднує всі скріни в один Session Judge\n"
-        "• ЗАТВЕРДЖУЮ — зафіксувати фінальне рішення\n"
-        "• ЧОМУ? — повні факти та правила рішення\n"
-        "• СКАСУВАТИ — закрити сесію без рішення\n"
-        "• WEBULL / МОЇ ПОЗИЦІЇ / ДОСЬЄ — Guardian і журнал\n"
-        "• СТАТУС — версія й стан\n\n"
+        "Одна команда → повна автоматична перевірка → одне рішення.\n"
+        "Скріншоти для торгової ідеї не потрібні.\n\n"
+        "Напиши одним рядком:\n"
+        "• SOFI CALL 16.5\n"
+        "• SOFI PUT 16,5\n"
+        "• SOFI CALL-PUT 16.5 — порівняти обидва боки\n\n"
+        "SAFARI сам читає Webull: ціну, контракт, Bid/Ask, OI, Volume, IV, Greeks, "
+        "5m/15m, earnings і аналітичний консенсус; окремо перевіряє актуальні новини.\n\n"
+        "• ЧОМУ? — повний аудит за/проти та джерела\n"
+        "• WEBULL — синхронізація відкритих позицій\n"
+        "• МОЇ ПОЗИЦІЇ / ДОСЬЄ — Guardian і журнал\n"
+        "• СТАТУС / САМОТЕСТ — стан системи\n\n"
+        "🔒 READ ONLY: SAFARI ніколи не виконує угоду.\n"
         f"💾 Пам’ять: {storage}"
     )
 
@@ -242,7 +245,8 @@ async def status_command(update: Update) -> None:
         f"Режим: READ ONLY ✅\n"
         f"Router: deterministic ✅\n"
         f"State: {pending_line}\n"
-        f"Session Judge: {session_line}\n"
+        f"Legacy Session Judge: {session_line}\n"
+        f"Auto Judge: one-command Webull + news ✅\n"
         f"OpenAI model: {OPENAI_MODEL}\n"
         f"Webull: {'configured' if webull_reader and webull_reader.enabled else 'not configured'}"
     )
@@ -253,7 +257,7 @@ async def why_message(update: Update) -> None:
         return
     reason = clean_text(state_store.user(update.effective_user.id).get("last_full_reason"), "")
     if not reason:
-        await update.message.reply_text("🦁 SAFARI\n\nСпочатку надішли торговий скрін або виконай WEBULL.")
+        await update.message.reply_text("🦁 SAFARI\n\nСпочатку напиши ідею, наприклад: SOFI CALL 16.5.")
         return
     await send_long_message(update.message, "🔍 ЧОМУ?\n\n" + reason)
 
@@ -479,10 +483,109 @@ async def analyze_image_message(
                 pass
 
 
+async def auto_trade_message(update: Update, idea: TradeIdea) -> None:
+    if not update.message or not update.effective_user:
+        return
+    if not _webull_ready():
+        await update.message.reply_text(
+            "🦁 SAFARI AUTO JUDGE\n\n❌ Webull market data is not configured. "
+            "Перевір ключі й команду WEBULL AUTH."
+        )
+        return
+    if safari_ai is None:
+        await update.message.reply_text("🦁 SAFARI AUTO JUDGE\n\n❌ OpenAI API не налаштований для перевірки новин.")
+        return
+    if not await _webull_guard(update.message):
+        return
+
+    assert webull_reader is not None
+    label = f"{idea.ticker} {idea.direction}" + (f" ≈ ${idea.approximate_strike:.2f}" if idea.approximate_strike else "")
+    status = await update.message.reply_text(
+        "🦁 SAFARI 1.7.0 AUTO JUDGE\n\n"
+        f"🔎 Перевіряю {label}\n"
+        "Webull: ціна, ланцюг, Greeks, OI/Volume, 5m/15m, earnings.\n"
+        "Web: актуальні новини й каталізатори.\n\n"
+        "⏳ Одне готове рішення після повної перевірки…"
+    )
+    async with webull_operation_lock:
+        try:
+            market_task = webull_reader.market_research(
+                idea.ticker, idea.direction, idea.approximate_strike
+            )
+            news_task = safari_ai.research_ticker(idea.ticker, idea.direction)
+            market_result, news_result = await asyncio.gather(
+                market_task, news_task, return_exceptions=True
+            )
+            if isinstance(market_result, Exception):
+                raise market_result
+            if isinstance(news_result, Exception):
+                logger.warning("News research failed for %s: %s", idea.ticker, news_result)
+                news_result = {
+                    "status": "unavailable",
+                    "sentiment": "NEUTRAL",
+                    "sentiment_score": 0,
+                    "summary": "Актуальні новини не вдалося отримати; SAFARI не вгадує.",
+                    "bullish_factors": [],
+                    "bearish_factors": [],
+                    "catalysts": [],
+                    "sources": [],
+                }
+            result = build_auto_decision(idea, market_result, news_result)
+            user = state_store.user(update.effective_user.id)
+            user["last_analysis"] = result
+            user["last_full_reason"] = result.get("full_reason", "")
+            user["last_auto_decision"] = result
+            user["pending_intent"] = None
+            user["trade_session"] = None
+            state_store.update_user(update.effective_user.id, user)
+            state_store.audit(
+                update.effective_user.id,
+                {
+                    "route": "AUTO_JUDGE",
+                    "ticker": idea.ticker,
+                    "direction": idea.direction,
+                    "verdict": result.get("verdict"),
+                },
+            )
+            answer = result.get("six_line", "") + "\n\n🔍 Напиши ЧОМУ? — повний аудит за/проти й джерела.\n🔒 READ ONLY: угод не виконував."
+            if len(answer) <= MAX_TELEGRAM_MESSAGE:
+                await status.edit_text(answer)
+            else:
+                await status.edit_text(answer[:MAX_TELEGRAM_MESSAGE])
+                await send_long_message(update.message, answer[MAX_TELEGRAM_MESSAGE:])
+        except WebullReadOnlyError as error:
+            logger.warning("Auto Judge Webull failure code=%s: %s", error.code, error)
+            if error.code in {"NO_TOKEN", "TOKEN_NOT_READY", "INVALID_TOKEN"}:
+                action = "Напиши WEBULL AUTH, підтвердь доступ і потім повтори ідею."
+            elif error.code == "UNAUTHORIZED":
+                action = "Webull не дав доступ до market data. Перевір OpenAPI market-data subscription/permissions."
+            elif error.code == "RATE_LIMIT":
+                action = "Webull повернув rate limit. Не дублюй команду; повтори пізніше один раз."
+            else:
+                action = "Перевір WEBULL STATUS і логи Railway."
+            await status.edit_text(
+                "🦁 SAFARI AUTO JUDGE\n\n"
+                f"❌ Не отримав повний ринковий пакет: {error}\n\n👉 {action}"
+            )
+        except Exception as error:
+            incident = f"u{update.effective_user.id}-m{update.message.message_id}"
+            logger.exception("Auto Judge failed incident=%s: %s", incident, error)
+            await status.edit_text(
+                "🦁 SAFARI AUTO JUDGE\n\n"
+                f"❌ Повна перевірка не завершилась. Код події: {incident}.\n"
+                "SAFARI не формує угаданий вердикт із неповних даних."
+            )
+
+
 async def ingress_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user:
         return
     text, caption, has_photo, has_image_document = _message_content(update)
+    if text and not has_photo and not has_image_document:
+        idea = parse_auto_trade_command(text)
+        if idea is not None:
+            await auto_trade_message(update, idea)
+            return
     stored_pending = state_store.pending(update.effective_user.id)
     decision = route_envelope(
         text=text,
@@ -514,15 +617,15 @@ async def ingress_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if decision.route == "SET_TRADING_INTENT":
-        pending = make_pending_intent("TRADING", decision.ticker, decision.instrument or "UNKNOWN")
-        start_trade_session(state_store, update.effective_user.id, pending)
-        await update.message.reply_text(
-            "🎯 SAFARI SESSION JUDGE — СЕСІЮ ВІДКРИТО ✅\n\n"
-            f"Ідея: {pending.ticker} {pending.instrument}\n"
-            "Усі наступні скріни об'єднуються в ОДНЕ рішення.\n"
-            "Окремий скрін більше не отримує самостійний вердикт.\n\n"
-            "👉 Спочатку надішли option detail/chain, потім свіжий графік 5m або 15m."
-        )
+        direction = clean_text(decision.instrument, "").upper()
+        if decision.ticker and direction in {"CALL", "PUT"}:
+            await auto_trade_message(update, TradeIdea(decision.ticker.upper(), direction))  # type: ignore[arg-type]
+        else:
+            await update.message.reply_text(
+                "🎯 SAFARI AUTO JUDGE\n\n"
+                "Напиши ідею одним рядком, наприклад:\n"
+                "SOFI CALL 16.5\nSOFI PUT 16.5\nSOFI CALL-PUT 16.5"
+            )
         return
 
     if decision.route == "SET_GUARDIAN_INTENT":
@@ -532,7 +635,11 @@ async def ingress_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if decision.route == "INCOMPLETE_TRADING":
-        await update.message.reply_text("🎯 SAFARI TRADING\n\nВкажи тикер і напрямок. Приклад:\nТРЕЙДИНГ TSLA CALL")
+        await update.message.reply_text(
+            "🎯 SAFARI AUTO JUDGE\n\n"
+            "Вкажи тикер, напрямок і бажаний страйк:\n"
+            "SOFI CALL 16.5\nSOFI PUT 16.5\nSOFI CALL-PUT 16.5"
+        )
         return
     if decision.route == "AMBIGUOUS_TEXT":
         await update.message.reply_text("🦁 SAFARI ROUTER\n\nУ повідомленні кілька команд.\n\n👉 Надішли лише одну команду за раз.")
@@ -584,9 +691,9 @@ async def ingress_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await status_command(update)
         return
     if decision.route == "SELFTEST":
-        failures = startup_self_check()
+        failures = startup_self_check() + autojudge_self_check()
         await update.message.reply_text(
-            "🧪 SAFARI SELFTEST\n\n" + ("✅ Core invariants passed." if not failures else "❌ " + "; ".join(failures))
+            "🧪 SAFARI SELFTEST\n\n" + ("✅ Core + Auto Judge invariants passed." if not failures else "❌ " + "; ".join(failures))
         )
         return
     if decision.route == "CLOSE_TRADE":
@@ -595,7 +702,7 @@ async def ingress_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if decision.route == "FALLBACK_TEXT":
         await update.message.reply_text(
             "🦁 SAFARI ROUTER\n\nКоманду не розпізнано.\n\n"
-            "Приклад: ТРЕЙДИНГ TSLA CALL, WEBULL, МОЇ ПОЗИЦІЇ, ЧОМУ?, ДОСЬЄ."
+            "Приклад: SOFI CALL 16.5, SOFI PUT 16.5, SOFI CALL-PUT 16.5, WEBULL, ЧОМУ?."
         )
 
 
@@ -628,7 +735,7 @@ def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
     WEBULL_TOKEN_DIR.mkdir(parents=True, exist_ok=True)
-    failures = startup_self_check()
+    failures = startup_self_check() + autojudge_self_check()
     if failures:
         raise RuntimeError("SAFARI startup self-check failed: " + "; ".join(failures))
     if not BOT_TOKEN:

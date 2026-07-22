@@ -1,128 +1,122 @@
-# 🦁 SAFARI 1.6.0 — SESSION JUDGE
+# 🦁 SAFARI 1.7.0 — AUTO JUDGE
 
-Telegram trading copilot, який збирає кілька торгових скрінів в одну сесію та видає одне узгоджене рішення. Це **не автоматичний торговий бот**.
+**Одна команда → автоматичний збір даних → одне холодне рішення.**
 
-## Безпека
+SAFARI більше не вимагає серію скріншотів для перевірки торгової ідеї. Користувач пише тикер, напрямок і приблизний страйк, а бот сам читає ринок через Webull OpenAPI, перевіряє актуальні новини через OpenAI web search і передає нормалізовані факти в детерміноване ядро.
 
-- `READ_ONLY_MODE = True` увімкнено жорстко.
-- SAFARI не створює, не змінює, не скасовує і не закриває ордери.
-- Webull-модуль лише читає авторизацію, рахунок і позиції.
-- AI лише витягує явно видимі факти зі скрінів.
-- Risk, data quality, hard stops і verdict визначає детермінований `safari_core.py`.
-
-## Що нового у 1.6.0
-
-1. `ТРЕЙДИНГ <TICKER> CALL/PUT` відкриває торгову сесію на 30 хвилин.
-2. Наступні скріни не аналізуються як незалежні угоди — вони додаються до одного Session Judge.
-3. Сесія може об’єднати target-контракт, протилежний CALL/PUT для порівняння та графік.
-4. Скрін іншого тикера не змішується з поточною угодою.
-5. Графік оцінюється лише за явно видимими числовими фактами: period change або Open/Close.
-6. Support, resistance, breakout і свічкові патерни не вигадуються.
-7. Target-контракт без свіжого графіка отримує `WAIT`.
-8. Напрямок графіка проти ідеї дає `PASS`.
-9. Узгоджений контракт + ліквідність + строк + свіжий графік можуть дати `TAKE`.
-10. `ЗАТВЕРДЖУЮ` фіксує фінальне рішення, але не виконує угоду.
-
-## Робочий цикл
+## Основні команди
 
 ```text
-ТРЕЙДИНГ SOFI CALL
+SOFI CALL 16.5
+SOFI PUT 16,5
+SOFI CALL-PUT 16.5
+TSLA CALL
+ТРЕЙДИНГ SOFI CALL СТРАЙК 16,5
 ```
 
-Після цього надсилай у межах однієї сесії:
+`CALL-PUT` означає: перевірити обидва боки й вибрати сильніший, а не автоматично радити угоду.
 
-- option detail або option chain потрібного напрямку;
-- за потреби протилежний бік для порівняння;
-- свіжий графік 5m або 15m.
-
-SAFARI після кожного нового скріну перераховує **всю сесію**, а не лише останнє зображення. Відповідь залишається у затвердженому шестирядковому форматі:
-
-```text
-🎯 Страйк
-📅 Експірація
-💰 Премія
-💪 Сила 0–5
-⚠️ Ризик 0–5
-✅/❌/⏸ Вердикт
-```
-
-Коли рішення влаштовує:
-
-```text
-ЗАТВЕРДЖУЮ
-```
-
-Щоб побачити повні факти та правила:
+Після рішення:
 
 ```text
 ЧОМУ?
 ```
 
-Щоб закрити незавершену сесію:
+Бот показує повний аудит: ринок, контракт, Greeks, OI/Volume, технічну картину, earnings, новини, аргументи за/проти, hard stops і джерела.
+
+## Що SAFARI збирає автоматично
+
+### Webull OpenAPI — READ ONLY
+
+- поточну ціну базового активу;
+- опціонні контракти біля заданого страйку;
+- Bid/Ask, mid і spread;
+- Open Interest і Volume;
+- IV, Delta, Gamma, Theta, Vega;
+- 5m та 15m bars;
+- EMA9, EMA21, RSI14, VWAP, ATR14;
+- дату earnings;
+- analyst target та analyst rating.
+
+### OpenAI web search
+
+- актуальні суттєві новини;
+- каталізатори;
+- bullish і bearish фактори;
+- короткий нейтральний підсумок;
+- джерела для команди `ЧОМУ?`.
+
+OpenAI не визначає фінальний вердикт. Він лише повертає структуроване дослідження. Остаточне рішення формує `safari_autojudge.py` за детермінованими правилами.
+
+## Вихід — затверджені 6 рядків
 
 ```text
-СКАСУВАТИ
+🎯 Страйк: $16.50 CALL
+📅 Експірація: 2026-08-21 (30 DTE)
+💰 Премія: $1.20–$1.25 (mid $1.23)
+💪 Сила: ■■■■□ 4/5
+⚠️ Ризик: ■■■□□ 3/5
+✅ Вердикт: TAKE — перевага підтверджена ринком, опціоном і новинами
 ```
 
-## Основні команди
+Можливі вердикти:
 
-- `ТРЕЙДИНГ TSLA CALL`
-- `ТРЕЙДИНГ SOFI PUT`
-- `ЗАТВЕРДЖУЮ`
-- `ЧОМУ?`
-- `СКАСУВАТИ`
-- `СТАТУС`
-- `САМОТЕСТ`
-- `GUARDIAN`
-- `WEBULL`
-- `WEBULL AUTH`
-- `WEBULL CHECK`
-- `МОЇ ПОЗИЦІЇ`
-- `ДОСЬЄ`
+- `TAKE` — перевага підтверджена й немає hard stop;
+- `WAIT` — бракує критичних даних, earnings занадто близько або сигнали змішані;
+- `PASS` — сильний конфлікт із напрямком, неприйнятна ліквідність/ризик або переваги немає.
+
+## Головний принцип безпеки
+
+```text
+READ_ONLY_MODE = True
+```
+
+SAFARI не імпортує і не викликає API створення, зміни, заміни або скасування ордерів. Бот тільки читає дані та формує аналітичне рішення.
 
 ## Архітектура
 
-- `bot.py` — єдиний Telegram ingress і керування сесією.
-- `safari_core.py` — deterministic router, validation, Session Judge, risk policy, memory і formatting.
-- `safari_ai.py` — structured extraction видимих фактів зі скрінів та нормалізація read-only Webull snapshot.
-- `safari_webull.py` — read-only Webull adapter.
-- `test_safari_session.py` — regression suite Session Judge.
+- `bot.py` — Telegram router, оркестрація Webull + news, збереження останнього рішення.
+- `safari_autojudge.py` — чисте детерміноване ядро нового режиму.
+- `safari_webull.py` — read-only Webull OpenAPI adapter.
+- `safari_ai.py` — структуровані новини та старий VISION/dossier шар.
+- `safari_core.py` — стабільне ядро, пам’ять, Guardian і legacy-функції.
+- `test_safari_autojudge.py` — регресійні тести Auto Judge.
 
-## Локальна перевірка
+## Необхідні Railway Variables
 
-```bash
-python -m unittest -v test_safari_core.py
-python -m unittest -v test_safari_session.py
-python -m compileall -q .
+```text
+TELEGRAM_BOT_TOKEN
+OPENAI_API_KEY
+OPENAI_MODEL=gpt-4.1-mini
+WEBULL_APP_KEY
+WEBULL_APP_SECRET
+WEBULL_REGION=us
+WEBULL_ENDPOINT=api.webull.com
+SAFARI_USER_TIMEZONE=America/Los_Angeles
 ```
 
-У підготовленому пакеті пройдено 12 тестів Session Judge, `startup_self_check()` і компіляцію всіх Python-файлів.
+Також потрібен чинний Webull OpenAPI token і доступ до відповідних market-data endpointів. Railway Volume має залишатися підключеним, щоб токен і локальний state не зникали після deployment.
 
-## Railway variables
+## Перевірка після deployment
 
-- `TELEGRAM_BOT_TOKEN`
-- `OPENAI_API_KEY`
-- `WEBULL_APP_KEY`
-- `WEBULL_APP_SECRET`
-- optional: `OPENAI_MODEL`, `WEBULL_REGION`, `WEBULL_ENDPOINT`
+У Telegram:
 
-Railway Volume має бути змонтований у `/data`; шлях передається через `RAILWAY_VOLUME_MOUNT_PATH`.
+```text
+САМОТЕСТ
+СТАТУС
+WEBULL STATUS
+SOFI CALL-PUT 16.5
+ЧОМУ?
+```
 
-## Rollout
+Очікуваний startup log:
 
-1. Замінити `bot.py`, `safari_core.py`, `safari_ai.py` і `README.md`.
-2. Додати `test_safari_session.py`.
-3. Не змінювати Railway variables.
-4. Дочекатися статусу Railway `Active`.
-5. У logs перевірити: `SAFARI 1.6.1 SESSION FLOW`, `read_only=True`, `router=single_ingress`.
-6. У Telegram виконати `САМОТЕСТ`.
-7. Відкрити тестову сесію, надіслати контракт і графік, потім виконати `ЗАТВЕРДЖУЮ`.
+```text
+SAFARI 1.7.0 AUTO JUDGE started
+read_only=True
+Application started
+```
 
+## Важлива межа
 
-## 1.6.1 Session Flow
-
-- Кожний скрін спочатку лише додається до активної сесії.
-- До повного комплекту доказів бот показує короткий статус збору, а не 6-рядковий вердикт.
-- Фінальний формат із 6 рядків з’являється лише після актуального контракту з OI/Volume/IV/Greeks та свіжого графіка 5m або 15m.
-- Monthly/Weekly/Time & Sales не замінюють 5m/15m підтвердження входу.
-- `ЗАТВЕРДЖУЮ` не закриває незавершену сесію.
+Жоден алгоритм не гарантує прибуток. `TAKE` означає лише, що поточний набір перевірок пройдено за правилами SAFARI. Користувач сам приймає рішення й сам контролює розмір ризику.

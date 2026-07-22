@@ -38,6 +38,27 @@ class WebullNormalization(BaseModel):
     guardian: WebullGuardian = Field(default_factory=WebullGuardian)
 
 
+class NewsSource(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str
+    url: str
+    published_at: str | None = None
+
+
+class MarketResearchBrief(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["ok", "unavailable"] = "ok"
+    sentiment: Literal["BULLISH", "BEARISH", "MIXED", "NEUTRAL"] = "NEUTRAL"
+    sentiment_score: int = Field(default=0, ge=-2, le=2)
+    summary: str = ""
+    bullish_factors: list[str] = Field(default_factory=list)
+    bearish_factors: list[str] = Field(default_factory=list)
+    catalysts: list[str] = Field(default_factory=list)
+    sources: list[NewsSource] = Field(default_factory=list)
+
+
 class ClosedTradeRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -106,6 +127,33 @@ WEBULL_INSTRUCTIONS = """
 Якщо поля немає — source="missing".
 Guardian decision без графіка/тези має бути WAIT.
 """.strip()
+
+MARKET_RESEARCH_INSTRUCTIONS = """
+Ти — новинний дослідник для READ-ONLY опціонного помічника SAFARI.
+Знайди актуальні публічні факти про вказаний тикер і поверни ЛИШЕ JSON.
+
+ПРАВИЛА:
+1. Використовуй веб-пошук. Віддавай перевагу офіційним investor relations, SEC/регуляторним матеріалам і великим діловим медіа.
+2. Шукай суттєві новини, каталізатори, earnings/гайденс, регуляторні та корпоративні події.
+3. Не вигадуй новин, дат, рейтингів чи цінових цілей.
+4. sentiment_score: -2 сильно негативно, -1 негативно, 0 змішано/нейтрально, +1 позитивно, +2 сильно позитивно.
+5. Оцінюй загальний фон тикера, а не підганяй висновок під CALL або PUT.
+6. Джерела мають містити реальні URL. Максимум 8 джерел.
+7. Не давай торгового вердикту. Остаточне рішення приймає deterministic core.
+
+Точна JSON-схема:
+{
+  "status": "ok",
+  "sentiment": "BULLISH|BEARISH|MIXED|NEUTRAL",
+  "sentiment_score": -2,
+  "summary": "короткий підсумок українською",
+  "bullish_factors": ["..."],
+  "bearish_factors": ["..."],
+  "catalysts": ["..."],
+  "sources": [{"title":"...", "url":"https://...", "published_at":"YYYY-MM-DD або null"}]
+}
+""".strip()
+
 
 CLOSED_TRADE_INSTRUCTIONS = """
 Витягни лише явно вказані факти про завершену угоду. Не вигадуй відсутні цифри.
@@ -183,6 +231,44 @@ class SafariAI:
         if not isinstance(parsed, WebullNormalization):
             raise RuntimeError("OpenAI returned no parsed Webull normalization")
         return parsed
+
+
+    @staticmethod
+    def _json_object(text: str) -> dict[str, Any]:
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.strip("`")
+            if cleaned.lower().startswith("json"):
+                cleaned = cleaned[4:].lstrip()
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start < 0 or end <= start:
+            raise RuntimeError("OpenAI research returned no JSON object")
+        payload = json.loads(cleaned[start : end + 1])
+        if not isinstance(payload, dict):
+            raise RuntimeError("OpenAI research JSON is not an object")
+        return payload
+
+    async def research_ticker(self, ticker: str, direction: str) -> dict[str, Any]:
+        prompt = (
+            f"Тикер: {ticker.upper()}\n"
+            f"Ідея користувача: {direction.upper()} (лише контекст, не підганяй новини під напрямок).\n"
+            "Знайди найактуальніші суттєві публічні новини й каталізатори. "
+            "Поверни тільки JSON за заданою схемою."
+        )
+        response = await self.client.responses.create(
+            model=self.model,
+            instructions=MARKET_RESEARCH_INSTRUCTIONS,
+            input=prompt,
+            tools=[{"type": "web_search"}],
+            max_output_tokens=2200,
+            store=False,
+        )
+        output_text = getattr(response, "output_text", "")
+        payload = self._json_object(output_text)
+        parsed = MarketResearchBrief.model_validate(payload)
+        return parsed.model_dump()
+
 
     async def parse_closed_trade(self, text: str) -> ClosedTradeRecord:
         response = await self.client.responses.parse(
