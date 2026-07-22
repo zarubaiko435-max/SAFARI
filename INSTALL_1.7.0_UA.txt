@@ -1,0 +1,106 @@
+🦁 SAFARI 1.7.0 AUTO JUDGE — ПОКРОКОВЕ ВСТАНОВЛЕННЯ
+
+ВАЖЛИВО:
+- Це повний release, а не дрібний патч.
+- Версія 1.6.1 залишається в історії GitHub і може бути rollback.
+- Не видаляй Railway Variables або Volume.
+
+КРОК 1 — РОЗПАКУЙ ZIP
+1. Завантаж SAFARI_1.7.0_AUTO_JUDGE.zip.
+2. Відкрий Downloads.
+3. Розпакуй архів.
+4. Усередині має бути папка SAFARI_1_7_0_RELEASE.
+
+КРОК 2 — СТВОРИ БЕЗПЕЧНУ ГІЛКУ
+1. Відкрий GitHub → репозиторій SAFARI.
+2. Переконайся, що вибрано main.
+3. Натисни main.
+4. Введи SAFARI-1.7.0.
+5. Натисни Create branch SAFARI-1.7.0 from main.
+
+КРОК 3 — ЗАВАНТАЖ ФАЙЛИ
+1. У гілці SAFARI-1.7.0 натисни Add file → Upload files.
+2. Натисни choose your files.
+3. Відкрий SAFARI_1_7_0_RELEASE.
+4. Виділи всі файли Ctrl+A → Open.
+5. Commit message: SAFARI 1.7.0 AUTO JUDGE.
+6. Залиш Commit directly to the SAFARI-1.7.0 branch.
+7. Натисни Commit changes.
+
+КРОК 4 — PULL REQUEST
+1. Натисни Compare & pull request.
+2. Перевір: base main ← compare SAFARI-1.7.0.
+3. Натисни Create pull request.
+4. Переконайся, що GitHub показує Ready to merge.
+5. Натисни Merge pull request → Confirm merge.
+
+КРОК 5 — RAILWAY
+1. Відкрий Railway → сервіс SAFARI → Deployments.
+2. Дочекайся ACTIVE / Deployment successful.
+3. Відкрий View logs.
+4. Шукай:
+   SAFARI 1.7.0 AUTO JUDGE started
+   read_only=True
+   Application started
+
+КРОК 6 — TELEGRAM SELFTEST
+Надішли:
+
+САМОТЕСТ
+
+Очікується:
+✅ Core invariants passed.
+✅ Auto Judge invariants passed.
+
+Потім:
+
+СТАТУС
+
+Має бути версія 1.7.0 AUTO JUDGE і READ ONLY.
+
+КРОК 7 — LIVE WEBULL TEST
+Надішли один раз:
+
+WEBULL STATUS
+
+Якщо токен не готовий:
+WEBULL AUTH
+→ підтверди OpenAPI Notice у Webull
+→ WEBULL CHECK
+
+КРОК 8 — ГОЛОВНИЙ ТЕСТ
+Надішли:
+
+SOFI CALL-PUT 16.5
+
+Не надсилай скрінів. Бот сам має написати, що перевіряє:
+- Webull price/options/Greeks/OI/Volume/5m/15m/earnings;
+- актуальні новини;
+а потім видати рівно 6 рядків.
+
+Після рішення надішли:
+
+ЧОМУ?
+
+Перевір, що є:
+- ринок 5m/15m;
+- контракт і Greeks;
+- OI/Volume;
+- earnings;
+- новини;
+- ЗА/ПРОТИ;
+- рішення;
+- джерела;
+- READ ONLY.
+
+ROLLBACK, ЯКЩО LIVE API НЕ ПРАЦЮЄ
+1. Не видаляй branch SAFARI-1.7.0 до завершення тесту.
+2. У GitHub відкрий merge commit 1.7.0.
+3. Натисни Revert і створи rollback pull request.
+4. Merge rollback PR — Railway автоматично повернеться до попередньої main.
+
+ВІДОМІ УМОВИ LIVE-ТЕСТУ
+- Webull OpenAPI account/token має бути чинним.
+- Market-data endpoints можуть вимагати відповідні permissions/subscription.
+- OPENAI_API_KEY має бути чинним.
+- Railway Volume має залишатися підключеним.
