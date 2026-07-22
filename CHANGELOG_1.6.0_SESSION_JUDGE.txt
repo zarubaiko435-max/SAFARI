@@ -1,0 +1,23 @@
+SAFARI 1.6.0 — SESSION JUDGE
+
+ADDED
+- Persistent multi-screenshot trade_session in JSON state schema v3.
+- Session aggregation for target option, opposite CALL/PUT comparison and chart screenshots.
+- Deterministic chart direction from visible period change or visible Open/Close only.
+- Six-line Session Judge result with 0–5 strength and risk scores.
+- CONFIRM_TRADE route: ЗАТВЕРДЖУЮ / ПІДТВЕРДЖУЮ / CONFIRM.
+- Confirmed trade ideas journal in state memory.
+- Session status in СТАТУС.
+- Regression tests for WAIT/TAKE/PASS, comparison-side handling, ticker isolation and read-only safety.
+
+CHANGED
+- TRADING pending intent stays open while screenshots are accumulated.
+- Every new screenshot recalculates the whole session instead of replacing the previous judgment.
+- A complete target contract without a current chart returns WAIT.
+- A chart opposing the requested direction returns PASS.
+- 0–3 DTE and other deterministic hard stops still override chart confirmation.
+
+SAFETY
+- READ_ONLY_MODE remains True.
+- No order create/modify/cancel/close API was added.
+- AI remains fact extraction only; verdict logic remains deterministic.

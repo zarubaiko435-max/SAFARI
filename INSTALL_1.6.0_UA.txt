@@ -1,0 +1,27 @@
+БРО 😎 ВСТАНОВЛЕННЯ SAFARI 1.6.0
+
+У GitHub репозиторії SAFARI заміни:
+- bot.py
+- safari_core.py
+- safari_ai.py
+- README.md
+
+Додай нові файли:
+- test_safari_session.py
+- CHANGELOG_1.6.0_SESSION_JUDGE.txt
+- RELEASE_CHECKLIST_1.6.0.md
+
+safari_webull.py і requirements.txt можна залишити без змін; їх копії є в пакеті для повноти.
+Railway variables НЕ змінювати.
+
+Після commit:
+1. Дочекатися Railway Active.
+2. У Telegram написати САМОТЕСТ.
+3. Написати ТРЕЙДИНГ SOFI CALL.
+4. Надіслати свіжий option detail/chain.
+5. Надіслати свіжий графік 5m або 15m.
+6. Перевірити шестирядковий Session Judge.
+7. Написати ЧОМУ?
+8. Лише після перевірки написати ЗАТВЕРДЖУЮ.
+
+Бот залишається READ ONLY і не виконує угод.
