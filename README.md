@@ -1,4 +1,4 @@
-# 🦁 SAFARI 1.7.0 — AUTO JUDGE
+# 🦁 SAFARI 1.7.1 — DIAGNOSTIC
 
 **Одна команда → автоматичний збір даних → одне холодне рішення.**
 
@@ -112,7 +112,7 @@ SOFI CALL-PUT 16.5
 Очікуваний startup log:
 
 ```text
-SAFARI 1.7.0 AUTO JUDGE started
+SAFARI 1.7.1 DIAGNOSTIC started
 read_only=True
 Application started
 ```

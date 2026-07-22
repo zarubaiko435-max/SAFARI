@@ -1,4 +1,4 @@
-"""🦁 SAFARI 1.7.0 AUTO JUDGE — one-command, read-only trading copilot."""
+"""🦁 SAFARI 1.7.1 DIAGNOSTIC — one-command, read-only trading copilot."""
 
 from __future__ import annotations
 
@@ -501,7 +501,7 @@ async def auto_trade_message(update: Update, idea: TradeIdea) -> None:
     assert webull_reader is not None
     label = f"{idea.ticker} {idea.direction}" + (f" ≈ ${idea.approximate_strike:.2f}" if idea.approximate_strike else "")
     status = await update.message.reply_text(
-        "🦁 SAFARI 1.7.0 AUTO JUDGE\n\n"
+        "🦁 SAFARI 1.7.1 DIAGNOSTIC\n\n"
         f"🔎 Перевіряю {label}\n"
         "Webull: ціна, ланцюг, Greeks, OI/Volume, 5m/15m, earnings.\n"
         "Web: актуальні новини й каталізатори.\n\n"
@@ -558,7 +558,22 @@ async def auto_trade_message(update: Update, idea: TradeIdea) -> None:
             if error.code in {"NO_TOKEN", "TOKEN_NOT_READY", "INVALID_TOKEN"}:
                 action = "Напиши WEBULL AUTH, підтвердь доступ і потім повтори ідею."
             elif error.code == "UNAUTHORIZED":
-                action = "Webull не дав доступ до market data. Перевір OpenAPI market-data subscription/permissions."
+                detail = str(error).lower()
+                if "insufficient permission" in detail or "subscribe" in detail or "permission" in detail:
+                    action = (
+                        "Webull підтвердив недостатні OpenAPI market-data permissions. "
+                        "Перевір окремі Non-Display підписки для stocks/options."
+                    )
+                elif "credential" in detail or "environment" in detail or "authentication required" in detail:
+                    action = (
+                        "Webull вказує на credentials/environment mismatch. "
+                        "Перевір WEBULL_ENDPOINT, WEBULL_REGION і чи ключі належать production."
+                    )
+                else:
+                    action = (
+                        "Webull повернув 401 без достатньої деталізації. "
+                        "Перевір логи: тепер SAFARI зберігає error_code/message без секретів."
+                    )
             elif error.code == "RATE_LIMIT":
                 action = "Webull повернув rate limit. Не дублюй команду; повтори пізніше один раз."
             else:
@@ -757,7 +772,7 @@ def main() -> None:
 
     logger.info(
         "SAFARI %s started | read_only=%s | router=single_ingress | webull_configured=%s | data_dir=%s | "
-        "openai=%s | telegram=%s | pydantic=%s | model=%s",
+        "openai=%s | telegram=%s | pydantic=%s | model=%s | webull_region=%s | webull_endpoint=%s",
         SAFARI_VERSION,
         READ_ONLY_MODE,
         bool(webull_reader and webull_reader.enabled),
@@ -766,6 +781,8 @@ def main() -> None:
         package_ver("python-telegram-bot"),
         package_ver("pydantic"),
         OPENAI_MODEL,
+        WEBULL_REGION,
+        WEBULL_ENDPOINT,
     )
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

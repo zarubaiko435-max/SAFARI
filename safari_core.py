@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-SAFARI_VERSION = "1.7.0 AUTO JUDGE"
+SAFARI_VERSION = "1.7.1 DIAGNOSTIC"
 STATE_SCHEMA_VERSION = 3
 READ_ONLY_MODE = True
 
