@@ -1,4 +1,4 @@
-"""🦁 SAFARI 1.6.0 SESSION JUDGE — multi-screenshot, read-only trading copilot."""
+"""🦁 SAFARI 1.6.1 SESSION FLOW — multi-screenshot, read-only trading copilot."""
 
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ from safari_core import (
     clean_text,
     format_analysis,
     format_dossier,
+    format_trade_session_progress,
     format_trade_session_result,
     format_local_positions,
     make_pending_intent,
@@ -451,7 +452,11 @@ async def analyze_image_message(
                 caption=update.message.caption or "",
                 user_timezone=USER_TIMEZONE,
             )
-            formatted = format_trade_session_result(session_result)
+            formatted = (
+                format_trade_session_result(session_result)
+                if bool(session_result.get("ready_for_final"))
+                else format_trade_session_progress(session_result)
+            )
         else:
             formatted = format_analysis(analysis)
         if len(formatted) <= MAX_TELEGRAM_MESSAGE:
