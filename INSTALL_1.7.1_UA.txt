@@ -1,0 +1,15 @@
+🦁 SAFARI 1.7.1 DIAGNOSTIC
+
+Мета: один раз отримати точну причину Webull 401.
+
+1. Створи branch SAFARI-1.7.1 від main.
+2. Завантаж усі файли цієї папки.
+3. Commit: SAFARI 1.7.1 DIAGNOSTIC.
+4. Pull request → merge у main.
+5. Дочекайся Railway ACTIVE.
+6. У логах має бути: SAFARI 1.7.1 DIAGNOSTIC started.
+7. У Telegram один раз надішли: SOFI CALL 16.5
+8. Надішли повну відповідь бота або рядок WEBULL_HTTP_ERROR з Railway.
+
+Нічого не купуй до точного повідомлення `Insufficient permission`.
+READ ONLY залишається увімкненим.

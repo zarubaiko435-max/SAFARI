@@ -94,7 +94,12 @@ class WebullReadOnly:
         if http_status == 417 or "INVALID_TOKEN" in combined:
             raise WebullReadOnlyError("INVALID_TOKEN", f"{operation}: token invalid or expired") from error
         if http_status in {401, 403} or "UNAUTHORIZED" in combined:
-            raise WebullReadOnlyError("UNAUTHORIZED", f"{operation}: unauthorized ({http_status or 'unknown'})") from error
+            detail_parts = [part for part in (error_code, error_msg) if part]
+            detail = " — ".join(detail_parts) or "no error detail"
+            raise WebullReadOnlyError(
+                "UNAUTHORIZED",
+                f"{operation}: unauthorized ({http_status or 'unknown'}) — {detail}",
+            ) from error
         raise WebullReadOnlyError("SDK_ERROR", f"{operation}: {error_msg}") from error
 
     def _api_call(self, operation: str, function: Any, *args: Any) -> Any:
@@ -114,20 +119,46 @@ class WebullReadOnly:
     @staticmethod
     def _response_json(response: Any, operation: str) -> Any:
         status_code = getattr(response, "status_code", None)
+        payload: Any = None
+        try:
+            payload = response.json()
+        except Exception:
+            payload = None
+
         if status_code != 200:
             body = clean_text(getattr(response, "text", ""), "невідома помилка")
-            upper = body.upper()
+            error_code = ""
+            error_message = ""
+            if isinstance(payload, dict):
+                error_code = clean_text(payload.get("error_code"), "")
+                error_message = clean_text(
+                    payload.get("message") or payload.get("error_msg") or payload.get("error"),
+                    "",
+                )
+            safe_detail = " — ".join(part for part in (error_code, error_message) if part)
+            if not safe_detail:
+                safe_detail = body[:300]
+            upper = f"{body} {error_code} {error_message}".upper()
+            logger.warning(
+                "WEBULL_HTTP_ERROR operation=%s status=%s error_code=%s message=%s",
+                operation,
+                status_code,
+                error_code or "UNKNOWN",
+                (error_message or body)[:300],
+            )
             if status_code == 429 or "TOO_MANY_REQUESTS" in upper:
                 raise WebullReadOnlyError("RATE_LIMIT", f"{operation}: Webull rate limit (429)")
             if status_code == 417 or "INVALID_TOKEN" in upper:
-                raise WebullReadOnlyError("INVALID_TOKEN", f"{operation}: token invalid or expired")
+                raise WebullReadOnlyError("INVALID_TOKEN", f"{operation}: token invalid or expired — {safe_detail}")
             if status_code in {401, 403}:
-                raise WebullReadOnlyError("UNAUTHORIZED", f"{operation}: unauthorized ({status_code})")
-            raise WebullReadOnlyError("HTTP_ERROR", f"{operation}: HTTP {status_code}")
-        try:
-            return response.json()
-        except Exception as error:
-            raise WebullReadOnlyError("INVALID_JSON", f"{operation}: invalid JSON response") from error
+                raise WebullReadOnlyError(
+                    "UNAUTHORIZED",
+                    f"{operation}: unauthorized ({status_code}) — {safe_detail}",
+                )
+            raise WebullReadOnlyError("HTTP_ERROR", f"{operation}: HTTP {status_code} — {safe_detail}")
+        if payload is not None:
+            return payload
+        raise WebullReadOnlyError("INVALID_JSON", f"{operation}: invalid JSON response")
 
     @staticmethod
     def _validate_token_payload(payload: Any, operation: str) -> dict[str, Any]:
