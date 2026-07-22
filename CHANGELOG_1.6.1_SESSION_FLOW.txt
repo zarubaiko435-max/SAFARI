@@ -1,0 +1,13 @@
+SAFARI 1.6.1 SESSION FLOW
+
+FIXED
+- Multi-screenshot sessions no longer emit a premature six-line verdict after every screenshot.
+- Incomplete sessions now return a collection-progress message.
+- Only visible 5m or 15m charts can confirm an entry direction.
+- Monthly, Weekly, Time & Sales and unknown timeframes do not replace the 5m/15m chart requirement.
+- ZATVERDZHUYU cannot confirm an incomplete session.
+
+UNCHANGED
+- READ ONLY remains enforced.
+- Webull adapter remains read-only.
+- Deterministic core remains the only verdict authority.

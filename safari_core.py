@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-SAFARI_VERSION = "1.6.0 SESSION JUDGE"
+SAFARI_VERSION = "1.6.1 SESSION FLOW"
 STATE_SCHEMA_VERSION = 3
 READ_ONLY_MODE = True
 
@@ -1194,6 +1194,24 @@ def _chart_direction(chart: ChartExtraction) -> tuple[str, str]:
     return "SIDEWAYS", evidence
 
 
+def _accepted_session_timeframe(value: Any) -> str | None:
+    """Return canonical 5m/15m only; higher timeframes are context, not entry confirmation."""
+    raw = normalize_text(value).casefold().replace(" ", "")
+    aliases = {
+        "5m": "5m",
+        "5min": "5m",
+        "5mins": "5m",
+        "5minute": "5m",
+        "5minutes": "5m",
+        "15m": "15m",
+        "15min": "15m",
+        "15mins": "15m",
+        "15minute": "15m",
+        "15minutes": "15m",
+    }
+    return aliases.get(raw)
+
+
 def _option_row_completeness(row: OptionRow) -> int:
     fields = [
         row.strike,
@@ -1236,6 +1254,8 @@ def judge_trade_session(
     contract_versions: dict[str, tuple[int, OptionRow, dict[str, Any], ScreenshotExtraction]] = {}
     opposite_contracts = 0
     chart_candidates: list[tuple[int, dict[str, Any], ScreenshotExtraction]] = []
+    rejected_chart_timeframes: list[str] = []
+    received_screen_types: list[str] = []
     ticker_conflicts: list[str] = []
 
     for index, snapshot in enumerate(snapshots):
@@ -1250,8 +1270,15 @@ def judge_trade_session(
                 f"Скрін #{index + 1}: очікується {ticker}, видно {', '.join(sorted(visible_tickers))}."
             )
             continue
+        received_screen_types.append(clean_text(extraction.screen_type, "unknown"))
         if extraction.screen_type == "chart":
-            chart_candidates.append((index, snapshot, extraction))
+            accepted_tf = _accepted_session_timeframe(extraction.chart.timeframe.value)
+            if accepted_tf:
+                chart_candidates.append((index, snapshot, extraction))
+            else:
+                rejected_chart_timeframes.append(
+                    clean_text(extraction.chart.timeframe.value, "невідомий timeframe")
+                )
         for row in extraction.option_rows:
             row_ticker = clean_text(row.ticker, "").upper() or clean_text(
                 extraction.ticker_header.value, ""
@@ -1284,14 +1311,20 @@ def judge_trade_session(
 
     latest_chart = max(chart_candidates, key=lambda item: item[0]) if chart_candidates else None
     chart_direction = "UNKNOWN"
-    chart_evidence = "Графік не надіслано."
+    chart_evidence = "Графік 5m/15m не надіслано."
     chart_freshness = "unconfirmed"
+    accepted_chart_timeframe: str | None = None
     if latest_chart:
         _, chart_snapshot, chart_extraction = latest_chart
+        accepted_chart_timeframe = _accepted_session_timeframe(chart_extraction.chart.timeframe.value)
         chart_direction, chart_evidence = _chart_direction(chart_extraction.chart)
         chart_analysis = chart_snapshot.get("analysis")
         if isinstance(chart_analysis, dict):
             chart_freshness = clean_text(chart_analysis.get("data_freshness"), "unconfirmed")
+    elif rejected_chart_timeframes:
+        chart_evidence = (
+            f"Отримано графік {rejected_chart_timeframes[-1]}, але для входу потрібен 5m або 15m."
+        )
 
     hard_stops: list[dict[str, str]] = []
     missing: list[str] = []
@@ -1454,6 +1487,29 @@ def judge_trade_session(
         verdict = "TAKE"
         action = "Умови підтверджені; перевір розмір ризику та самостійно затвердь рішення."
 
+    progress_missing = list(missing)
+    if selected_row is None:
+        if f"контракт {instrument}" not in progress_missing:
+            progress_missing.append(f"контракт {instrument}")
+    elif not contract_current:
+        progress_missing.append("актуальність контракту")
+    if latest_chart is None:
+        progress_missing.append("графік 5m/15m")
+    elif not chart_current:
+        progress_missing.append("актуальність графіка")
+
+    # The six-line verdict is final only after both the contract and an accepted
+    # 5m/15m chart are current and all critical contract fields are present.
+    ready_for_final = bool(
+        selected_row is not None
+        and contract_current
+        and latest_chart is not None
+        and accepted_chart_timeframe in {"5m", "15m"}
+        and chart_current
+        and not missing
+        and not ticker_conflicts
+    )
+
     stop_text = "; ".join(
         f"{item['name']}={item['status']} ({item['evidence']})" for item in hard_stops
     )
@@ -1490,10 +1546,65 @@ def judge_trade_session(
         "opposite_contracts_seen": opposite_contracts,
         "chart_direction": chart_direction,
         "chart_evidence": chart_evidence,
+        "accepted_chart_timeframe": accepted_chart_timeframe,
+        "rejected_chart_timeframes": rejected_chart_timeframes,
+        "received_screen_types": received_screen_types,
+        "progress_missing": progress_missing,
+        "ready_for_final": ready_for_final,
         "data_quality": selected_quality,
         "days_to_expiration": dte,
         "spread_percent": spread_pct,
     }
+
+
+def format_trade_session_progress(result: dict[str, Any]) -> str:
+    """Acknowledge collection without presenting a premature six-line verdict."""
+    ticker = clean_text(result.get("ticker"), "—")
+    instrument = clean_text(result.get("instrument"), "UNKNOWN")
+    screens = int(safe_float(result.get("screens_received")) or 0)
+    strike = clean_text(result.get("strike"), "—")
+    expiration = clean_text(result.get("expiration"), "—")
+    premium = clean_text(result.get("premium"), "—")
+    contract_text = (
+        f"{strike}, {expiration}, {premium}"
+        if strike != "—"
+        else "ще не збережено"
+    )
+    chart_tf = clean_text(result.get("accepted_chart_timeframe"), "")
+    chart_evidence = clean_text(result.get("chart_evidence"), "Графік 5m/15m ще не прийнято.")
+    chart_text = f"{chart_tf} — {chart_evidence}" if chart_tf else chart_evidence
+    labels = {
+        "strike": "Strike",
+        "expiration": "Expiration",
+        "bid": "Bid",
+        "ask": "Ask",
+        "open_interest": "OI",
+        "volume": "Volume",
+        "iv": "IV",
+        "delta": "Delta",
+        "theta": "Theta",
+        "актуальність контракту": "актуальність контракту",
+        "графік 5m/15m": "свіжий графік 5m/15m",
+        "актуальність графіка": "актуальність графіка",
+    }
+    missing_raw = result.get("progress_missing")
+    missing = missing_raw if isinstance(missing_raw, list) else []
+    translated: list[str] = []
+    for item in missing:
+        key = clean_text(item, "")
+        value = labels.get(key, key)
+        if value and value not in translated:
+            translated.append(value)
+    missing_text = ", ".join(translated) if translated else "очікується перевірка ядра"
+    return "\n".join(
+        [
+            f"📥 Скрін додано до сесії {ticker} {instrument} — всього {screens}",
+            f"🧾 Контракт: {contract_text}",
+            f"📊 Графік: {chart_text}",
+            f"⏳ Ще потрібно: {missing_text}",
+            "🎯 Остаточний 6-рядковий вердикт ще не сформовано.",
+        ]
+    )
 
 
 def format_trade_session_result(result: dict[str, Any]) -> str:
@@ -1761,7 +1872,7 @@ def confirm_trade_session(store: JsonStateStore, user_id: int) -> dict[str, Any]
     if not isinstance(session, dict):
         return None
     result = session.get("last_result")
-    if not isinstance(result, dict):
+    if not isinstance(result, dict) or not bool(result.get("ready_for_final")):
         return None
     confirmed = {
         "confirmed_at_utc": utc_now(),

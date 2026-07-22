@@ -15,6 +15,7 @@ from safari_core import (
     append_trade_session_snapshot,
     build_analysis,
     confirm_trade_session,
+    format_trade_session_progress,
     format_trade_session_result,
     judge_trade_session,
     route_envelope,
@@ -70,13 +71,13 @@ def option_screen(*, instrument="CALL", expiry="2026-08-21", ticker="SOFI") -> S
     )
 
 
-def chart_screen(*, change=1.2, ticker="SOFI") -> ScreenshotExtraction:
+def chart_screen(*, change=1.2, ticker="SOFI", timeframe="5m") -> ScreenshotExtraction:
     return ScreenshotExtraction(
         screen_type="chart",
         ticker_header=f(ticker, scope="screen_header"),
         underlying_price_header=f(17.55, scope="screen_header"),
         chart=ChartExtraction(
-            timeframe=f("5m", scope="chart"),
+            timeframe=f(timeframe, scope="chart"),
             period_change_percent=f(change, scope="chart"),
             open_price=f(17.30, scope="chart"),
             close_price=f(17.55, scope="chart"),
@@ -157,6 +158,29 @@ class SessionJudgeTests(unittest.TestCase):
         self.assertIsNone(user["pending_intent"])
         self.assertEqual(user["trade_session"]["status"], "confirmed")
         self.assertEqual(len(user["confirmed_trade_ideas"]), 1)
+
+
+    def test_incomplete_session_uses_progress_not_final(self):
+        result = self.append(option_screen())
+        self.assertFalse(result["ready_for_final"])
+        progress = format_trade_session_progress(result)
+        self.assertIn("Остаточний 6-рядковий вердикт ще не сформовано", progress)
+        self.assertNotIn("Вердикт:", progress)
+
+    def test_monthly_chart_does_not_count_as_entry_confirmation(self):
+        self.append(option_screen())
+        result = self.append(chart_screen(change=3.0, timeframe="Monthly"))
+        self.assertFalse(result["ready_for_final"])
+        self.assertIsNone(result["accepted_chart_timeframe"])
+        self.assertIn("Monthly", result["rejected_chart_timeframes"])
+        self.assertIn("5m або 15m", result["chart_evidence"])
+
+    def test_incomplete_session_cannot_be_confirmed(self):
+        self.append(option_screen())
+        self.assertIsNone(confirm_trade_session(self.store, self.user_id))
+        user = self.store.user(self.user_id)
+        self.assertIsNotNone(user["pending_intent"])
+        self.assertEqual(user["trade_session"]["status"], "collecting")
 
     def test_six_line_formatter(self):
         result = self.append(option_screen())
